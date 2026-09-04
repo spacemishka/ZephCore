@@ -4,9 +4,10 @@
  *
  * Auto-detects available sensors via Zephyr devicetree nodelabels.
  *
- * Environment sensors (temp/humidity/pressure):
- *   SHTC3, AHT20/DHT20/AM2301B, SHT4x, SHT3xD, BME280, BME680, BMP280, BMP388, LPS22HB
+ * Environment sensors (temp/humidity/pressure/light):
+ *   SHTC3, AHT20/DHT20/AM2301B, SHT4x, SHT3xD, BME280, BME680, BMP280, BMP388, LPS22HB, SPA06
  *   MCU die temperature as fallback (nordic,nrf-temp)
+ *   Board-local analog sensors (seeed,t1000e-analog: NTC thermistor + photocell)
  *
  * Power monitors (voltage/current/power):
  *   INA219, INA3221, INA226, INA228, INA230, INA232, INA236, INA237
@@ -48,8 +49,34 @@ LOG_MODULE_REGISTER(zephcore_sensors, CONFIG_ZEPHCORE_SENSORS_LOG_LEVEL);
 #if HAS_ENV_SENSORS
 static const struct device *temp_humidity_dev = NULL;
 static const struct device *pressure_dev = NULL;
+static const struct device *light_dev = NULL;
 static bool temp_dev_has_pressure = false;  /* BME280/BME680 also have pressure */
 static bool env_available = false;
+
+/* Is this sensor usable — bringing it up first if its node deferred init?
+ *
+ * A part behind a switched rail cannot be probed at POST_KERNEL. Regulators
+ * come up at priority 75 and sensors at 90, typically microseconds later, and a
+ * regulator-boot-on rail never applies its startup-delay-us (regulator_common_init
+ * takes the refcount-only branch, so regulator_delay() never runs). Such a node
+ * is marked zephyr,deferred-init and initialised from here instead, where the
+ * rail has had the whole boot to settle. See the i2c0 comment in the
+ * MeshTracker X1 DTS for the failure this prevents.
+ *
+ * Safe to call for every candidate on every board: do_device_init() marks a
+ * device initialized even when its init function failed, so device_init()
+ * answers -EALREADY for anything that already ran at POST_KERNEL and this
+ * reduces to a plain device_is_ready() check. */
+static bool sensor_ready(const struct device *dev)
+{
+	if (dev == NULL) {
+		return false;
+	}
+	if (!device_is_ready(dev)) {
+		(void)device_init(dev);
+	}
+	return device_is_ready(dev);
+}
 #endif
 
 int env_sensors_init(void)
@@ -63,7 +90,7 @@ int env_sensors_init(void)
 
 	/* SHTC3 (e.g., RAK1901) */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(shtc3));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		temp_humidity_dev = dev;
 		LOG_INF("Found temp/humidity sensor: %s (SHTC3)", dev->name);
 		goto check_pressure;
@@ -71,13 +98,13 @@ int env_sensors_init(void)
 
 	/* Aosong AHT20/DHT20/AM2301B — same chip family, three compatible strings */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(aht20));
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(dht20));
 	}
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(am2301b));
 	}
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		temp_humidity_dev = dev;
 		LOG_INF("Found temp/humidity sensor: %s (AHT20/DHT20)", dev->name);
 		goto check_pressure;
@@ -85,7 +112,7 @@ int env_sensors_init(void)
 
 	/* SHT4x */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(sht4x));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		temp_humidity_dev = dev;
 		LOG_INF("Found temp/humidity sensor: %s (SHT4x)", dev->name);
 		goto check_pressure;
@@ -93,7 +120,7 @@ int env_sensors_init(void)
 
 	/* SHT3xD */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(sht3xd));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		temp_humidity_dev = dev;
 		LOG_INF("Found temp/humidity sensor: %s (SHT3xD)", dev->name);
 		goto check_pressure;
@@ -101,7 +128,7 @@ int env_sensors_init(void)
 
 	/* BME280 — temperature + humidity + pressure */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(bme280));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		temp_humidity_dev = dev;
 		temp_dev_has_pressure = true;
 		LOG_INF("Found env sensor: %s (BME280 — temp/humidity/pressure)", dev->name);
@@ -110,7 +137,7 @@ int env_sensors_init(void)
 
 	/* BME680 — temperature + humidity + pressure (+ gas) */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(bme680));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		temp_humidity_dev = dev;
 		temp_dev_has_pressure = true;
 		LOG_INF("Found env sensor: %s (BME680 — temp/humidity/pressure)", dev->name);
@@ -123,7 +150,7 @@ check_pressure:
 	if (!temp_dev_has_pressure) {
 		/* LPS22HB (e.g., RAK1902) */
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(lps22hb));
-		if (dev && device_is_ready(dev)) {
+		if (sensor_ready(dev)) {
 			pressure_dev = dev;
 			LOG_INF("Found pressure sensor: %s (LPS22HB)", dev->name);
 			goto done;
@@ -131,7 +158,7 @@ check_pressure:
 
 		/* BMP280 — pressure + temperature (lower priority as temp source) */
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(bmp280));
-		if (dev && device_is_ready(dev)) {
+		if (sensor_ready(dev)) {
 			pressure_dev = dev;
 			LOG_INF("Found pressure sensor: %s (BMP280)", dev->name);
 			goto done;
@@ -139,15 +166,40 @@ check_pressure:
 
 		/* BMP388 */
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(bmp388));
-		if (dev && device_is_ready(dev)) {
+		if (sensor_ready(dev)) {
 			pressure_dev = dev;
 			LOG_INF("Found pressure sensor: %s (BMP388)", dev->name);
+			goto done;
+		}
+
+		/* SPA06 — the two nodes are the same part at its two possible
+		 * addresses; the one that isn't there fails its ID check. */
+		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(spa06));
+		if (!sensor_ready(dev)) {
+			dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(spa06_alt));
+		}
+		if (sensor_ready(dev)) {
+			pressure_dev = dev;
+			LOG_INF("Found pressure sensor: %s (SPA06)", dev->name);
 			goto done;
 		}
 	}
 
 done:
-	env_available = (temp_humidity_dev != NULL) || (pressure_dev != NULL);
+	/* === Board-local analog sensors ===
+	 * Not on any bus — a thermistor and a photocell wired straight to the
+	 * SoC's ADC, so there is nothing to probe and the node's presence in DT
+	 * is the whole detection. Its thermistor is read last in
+	 * env_sensors_read() and only fills in a temperature nothing else
+	 * supplied — a dedicated part beats a thermistor inside the case. */
+	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(t1000e_sensors));
+	if (sensor_ready(dev)) {
+		light_dev = dev;
+		LOG_INF("Found analog sensors: %s (T1000-E NTC + photocell)", dev->name);
+	}
+
+	env_available = (temp_humidity_dev != NULL) || (pressure_dev != NULL) ||
+			(light_dev != NULL);
 	if (!env_available) {
 		LOG_INF("No environment sensors found");
 	}
@@ -204,6 +256,32 @@ int env_sensors_read(struct env_data *data)
 			data->pressure_hpa = sensor_value_to_float(&val) * 10.0f;
 			data->has_pressure = true;
 		}
+		/* Barometers carry a die temperature. It beats the MCU's own
+		 * sensor as a fallback on boards with no dedicated temp part. */
+		if (!data->has_temperature &&
+		    sensor_channel_get(pressure_dev, SENSOR_CHAN_AMBIENT_TEMP, &val) == 0) {
+			data->temperature_c = sensor_value_to_float(&val);
+			data->has_temperature = true;
+		}
+	}
+
+	/* === Board-local analog sensors (light, and thermistor as fallback) ===
+	 * One fetch covers both channels — it switches the sensor rail, so
+	 * splitting it would pay that cost twice. */
+	if (light_dev) {
+		if (sensor_sample_fetch(light_dev) == 0) {
+			if (sensor_channel_get(light_dev, SENSOR_CHAN_LIGHT, &val) == 0) {
+				data->luminosity = sensor_value_to_float(&val);
+				data->has_luminosity = true;
+			}
+			/* Only where no bus sensor — nor a barometer's die
+			 * channel above — already produced a temperature. */
+			if (!data->has_temperature &&
+			    sensor_channel_get(light_dev, SENSOR_CHAN_AMBIENT_TEMP, &val) == 0) {
+				data->temperature_c = sensor_value_to_float(&val);
+				data->has_temperature = true;
+			}
+		}
 	}
 
 	/* === MCU die temperature — always read when available ===
@@ -219,7 +297,7 @@ int env_sensors_read(struct env_data *data)
 	}
 
 	return (data->has_temperature || data->has_humidity || data->has_pressure ||
-	        data->has_mcu_temperature) ? 0 : -ENODATA;
+	        data->has_luminosity || data->has_mcu_temperature) ? 0 : -ENODATA;
 #else
 	return -ENOTSUP;
 #endif
@@ -254,7 +332,7 @@ int power_sensors_init(void)
 
 	/* INA3221 — 3-channel power monitor (check first — most channels) */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina3221));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		ina_dev = dev;
 		ina_found = INA_3221;
 		ina_num_channels = 3;
@@ -265,7 +343,7 @@ int power_sensors_init(void)
 
 	/* INA219 — standalone single-channel */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina219));
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		ina_dev = dev;
 		ina_found = INA_219;
 		ina_num_channels = 1;
@@ -276,22 +354,22 @@ int power_sensors_init(void)
 
 	/* ina2xx unified family — try all supported variants */
 	dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina226));
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina228));
 	}
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina230));
 	}
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina232));
 	}
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina236));
 	}
-	if (!dev || !device_is_ready(dev)) {
+	if (!sensor_ready(dev)) {
 		dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina237));
 	}
-	if (dev && device_is_ready(dev)) {
+	if (sensor_ready(dev)) {
 		ina_dev = dev;
 		ina_found = INA_2XX;
 		ina_num_channels = 1;

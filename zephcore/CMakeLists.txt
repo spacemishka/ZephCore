@@ -35,10 +35,61 @@ function(zephcore_apply_patches PATCH_DIR TARGET_DIR LABEL)
         file(READ "${_stamp}" _existing_hash)
         string(STRIP "${_existing_hash}" _existing_hash)
         if(_existing_hash STREQUAL _stamp_hash)
-            message(STATUS "  [${LABEL}] Patches already applied, skipping.")
-            return()
+            # The stamp hashes HEAD + patch contents and says nothing about the
+            # working tree.  A `git reset --hard` / `git checkout -- .` in the
+            # target tree reverts our patched files but leaves this stamp behind
+            # (it is untracked), and `west update` at an already-current
+            # revision does not move HEAD -- so the hash still matches and the
+            # build would skip patching and compile a pristine tree.  Depending
+            # on which patch was lost that is either a confusing configure-time
+            # failure or, worse, a silently unpatched binary.
+            #
+            # Verify instead of trusting: every patch here modifies tracked
+            # files only (none create or delete), so a patch that is applied
+            # always leaves its own paths dirty against HEAD.  Paths clean
+            # against HEAD therefore means "not applied" exactly.  Note this
+            # deliberately does NOT compare tree content to the patch: a dirty
+            # path is left alone, so the edit-the-driver-then-regenerate-the-
+            # patch workflow still builds your in-progress edits untouched.
+            set(_stamp_stale FALSE)
+            foreach(_pf ${PATCH_FILES})
+                execute_process(
+                    COMMAND git apply --numstat "${_pf}"
+                    WORKING_DIRECTORY "${TARGET_DIR}"
+                    OUTPUT_VARIABLE _vfy_numstat
+                    ERROR_QUIET
+                )
+                string(REGEX MATCHALL "[^\t\n]+\t[^\t\n]+\t[^\t\n]+"
+                       _vfy_lines "${_vfy_numstat}")
+                set(_vfy_paths "")
+                foreach(_line ${_vfy_lines})
+                    string(REGEX REPLACE "^[^\t]+\t[^\t]+\t" "" _p "${_line}")
+                    list(APPEND _vfy_paths "${_p}")
+                endforeach()
+                if(_vfy_paths)
+                    execute_process(
+                        COMMAND git diff --quiet -- ${_vfy_paths}
+                        WORKING_DIRECTORY "${TARGET_DIR}"
+                        RESULT_VARIABLE _vfy_clean
+                        OUTPUT_QUIET ERROR_QUIET
+                    )
+                    if(_vfy_clean EQUAL 0)
+                        get_filename_component(_vfy_name "${_pf}" NAME)
+                        message(STATUS
+                            "  [${LABEL}] Stamp says applied but ${_vfy_name} "
+                            "is missing from the tree — re-applying all.")
+                        set(_stamp_stale TRUE)
+                        break()
+                    endif()
+                endif()
+            endforeach()
+            if(NOT _stamp_stale)
+                message(STATUS "  [${LABEL}] Patches already applied, skipping.")
+                return()
+            endif()
+        else()
+            message(STATUS "  [${LABEL}] Patch set changed, re-applying...")
         endif()
-        message(STATUS "  [${LABEL}] Patch set changed, re-applying...")
     endif()
     foreach(PATCH_FILE ${PATCH_FILES})
         get_filename_component(PATCH_NAME ${PATCH_FILE} NAME)
@@ -180,18 +231,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/patches/modules/hal-espressif)
     )
 endif()
 
-# Copy new files into Zephyr tree
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/patches/zephyr-new)
-    file(GLOB_RECURSE ZEPHCORE_NEW_FILES
-         RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/patches/zephyr-new
-         ${CMAKE_CURRENT_SOURCE_DIR}/patches/zephyr-new/*)
-    foreach(REL_PATH ${ZEPHCORE_NEW_FILES})
-        set(SRC_FILE ${CMAKE_CURRENT_SOURCE_DIR}/patches/zephyr-new/${REL_PATH})
-        set(DST_FILE ${ZEPHYR_DIR}/${REL_PATH})
-        configure_file(${SRC_FILE} ${DST_FILE} COPYONLY)
-        message(STATUS "  [zephyr-new] ${REL_PATH}")
-    endforeach()
-endif()
+# Copy new files into Zephyr tree.
+# Shared with sysbuild/CMakeLists.txt, which must do the same thing before
+# MCUboot's devicetree pass — see the module for why.
+set(ZEPHCORE_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(ZEPHCORE_ZEPHYR_DIR ${ZEPHYR_DIR})
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/zephyr_new_files.cmake)
 
 # Custom board root: boards/<mcu>/<board>/ discovered via BOARD_ROOT
 list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
@@ -220,12 +265,21 @@ function(zephcore_auto_pair_overlay CONF_FILE)
     endif()
     string(REPLACE ".conf" ".overlay" OVERLAY_FILE "${CONF_FILE}")
     if(EXISTS "${OVERLAY_FILE}")
+        # Append once, keeping the FIRST position. The user-extras pairing loop
+        # below walks the whole combined EXTRA_CONF_FILE, so it re-pairs every
+        # conf the auto chain already paired -- board.overlay used to land in
+        # the list three times that way. Position is precedence in devicetree,
+        # so silently re-appending an overlay also moved it later and let it
+        # override things it was never meant to.
         if(EXTRA_DTC_OVERLAY_FILE)
-            set(EXTRA_DTC_OVERLAY_FILE "${EXTRA_DTC_OVERLAY_FILE};${OVERLAY_FILE}" PARENT_SCOPE)
+            if(NOT "${OVERLAY_FILE}" IN_LIST EXTRA_DTC_OVERLAY_FILE)
+                set(EXTRA_DTC_OVERLAY_FILE "${EXTRA_DTC_OVERLAY_FILE};${OVERLAY_FILE}" PARENT_SCOPE)
+                message(STATUS "  [auto-pair] ${CONF_FILE} → ${OVERLAY_FILE}")
+            endif()
         else()
             set(EXTRA_DTC_OVERLAY_FILE "${OVERLAY_FILE}" PARENT_SCOPE)
+            message(STATUS "  [auto-pair] ${CONF_FILE} → ${OVERLAY_FILE}")
         endif()
-        message(STATUS "  [auto-pair] ${CONF_FILE} → ${OVERLAY_FILE}")
     endif()
 endfunction()
 
@@ -265,15 +319,15 @@ set(ZEPHCORE_COMMON_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/zephcore_com
 # Detect platform from board name and add platform-specific common config
 # For boards with qualifiers like "wio_tracker_l1/nrf52840", check both the full BOARD
 # string and the BOARD_QUALIFIERS which contains just the qualifier (e.g., "nrf52840")
-if(BOARD MATCHES ".*nrf52.*" OR BOARD MATCHES "rak4631" OR BOARD MATCHES "rak_wismesh_tag" OR BOARD MATCHES "rak3401_1watt" OR BOARD MATCHES "wio_tracker" OR BOARD MATCHES "ikoka_nano" OR BOARD MATCHES "t1000_e" OR BOARD MATCHES "thinknode_m1" OR BOARD MATCHES "thinknode_m3" OR BOARD MATCHES "thinknode_m6" OR BOARD MATCHES "promicro_lr2021" OR BOARD MATCHES "promicro_sx1262" OR BOARD MATCHES "sensecap_solar" OR BOARD MATCHES "xiao_nrf52840" OR BOARD MATCHES "lilygo_techo" OR BOARD MATCHES "lilygo_timpulse_plus" OR BOARD MATCHES "heltec_t114" OR BOARD MATCHES "heltec_t096" OR BOARD MATCHES "gat562" OR BOARD MATCHES "muziworks_r1neo")
+if(BOARD MATCHES ".*nrf52.*" OR BOARD MATCHES "rak4631" OR BOARD MATCHES "rak_wismesh_tag" OR BOARD MATCHES "rak3401_1watt" OR BOARD MATCHES "wio_tracker" OR BOARD MATCHES "ikoka_nano" OR BOARD MATCHES "t1000_e" OR BOARD MATCHES "meshtracker_x1" OR BOARD MATCHES "thinknode_m1" OR BOARD MATCHES "thinknode_m3" OR BOARD MATCHES "thinknode_m6" OR BOARD MATCHES "promicro_lr2021" OR BOARD MATCHES "promicro_sx1262" OR BOARD MATCHES "sensecap_solar" OR BOARD MATCHES "xiao_nrf52840" OR BOARD MATCHES "lilygo_techo" OR BOARD MATCHES "lilygo_timpulse_plus" OR BOARD MATCHES "heltec_t114" OR BOARD MATCHES "heltec_t096" OR BOARD MATCHES "gat562" OR BOARD MATCHES "muziworks_r1neo")
     set(ZEPHCORE_PLATFORM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/nrf52_common.conf")
 elseif(DEFINED BOARD_QUALIFIERS AND BOARD_QUALIFIERS MATCHES ".*nrf52.*")
     set(ZEPHCORE_PLATFORM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/nrf52_common.conf")
-elseif(BOARD MATCHES ".*esp32.*" OR BOARD MATCHES "station_g2" OR BOARD MATCHES "thinknode_m9" OR BOARD MATCHES "lilygo_tlora_c6" OR BOARD MATCHES "heltec_wifi_lora32_v3" OR BOARD MATCHES "heltec_wifi_lora32_v4")
+elseif(BOARD MATCHES ".*esp32.*" OR BOARD MATCHES "station_g2" OR BOARD MATCHES "thinknode_m9" OR BOARD MATCHES "lilygo_tlora_c6" OR BOARD MATCHES "heltec_wifi_lora32_v3" OR BOARD MATCHES "heltec_wifi_lora32_v4" OR BOARD MATCHES "meshnology_w12")
     set(ZEPHCORE_PLATFORM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/esp32_common.conf")
 elseif(DEFINED BOARD_QUALIFIERS AND BOARD_QUALIFIERS MATCHES ".*esp32.*")
     set(ZEPHCORE_PLATFORM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/esp32_common.conf")
-elseif(BOARD MATCHES ".*nrf54l.*")
+elseif(BOARD MATCHES ".*nrf54l.*" OR BOARD MATCHES "me25ls02")
     set(ZEPHCORE_PLATFORM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/nrf54l_common.conf")
 elseif(DEFINED BOARD_QUALIFIERS AND BOARD_QUALIFIERS MATCHES ".*nrf54l.*")
     set(ZEPHCORE_PLATFORM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/nrf54l_common.conf")
@@ -311,6 +365,45 @@ endif()
 # Fallback: direct path without vendor subdirectory
 if(NOT ZEPHCORE_BOARD_CONF AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/board.conf")
     set(ZEPHCORE_BOARD_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/board.conf")
+endif()
+
+# ========== DTC Overlay Precedence ==========
+# board.overlay goes in FIRST, so everything applied after it can override it.
+#
+# Devicetree is last-writer-wins per property, and this list is that order. The
+# board overlay is the board's *baseline*; the overlays paired with the confs
+# that follow (repeater/pm_esp32/esp32s3_usb/no_display/...) are deliberate
+# per-role deviations from it, and the conf chain already documents that same
+# precedence ("user extras last so they can override"). Until 2026-08-28 the
+# overlay order was the exact opposite of the conf order, with two live
+# consequences:
+#   - esp32s3_usb.overlay could not move the console off USB Serial/JTAG on the
+#     boards that pick a console in board.overlay (heltec V4/V43, wireless
+#     tracker v2) -- the reroute was overridden and the console pointed at a
+#     peripheral that no longer owned the pins.
+#   - pm_esp32.overlay could not hold the SX1262 NSS across light sleep on
+#     heltec_wireless_tracker, whose board.overlay re-declares spi2 cs-gpios
+#     without ESP32_GPIO_SLEEP_HOLD_EN -- i.e. the exact floating-NSS failure
+#     that overlay exists to prevent.
+# partitions.overlay is appended after everything (see below) and stays there:
+# it must also be fed verbatim to the MCUboot image.
+set(ZEPHCORE_BOARD_OVERLAY "")
+file(GLOB_RECURSE BOARD_OVERLAY_CANDIDATES "${CMAKE_CURRENT_SOURCE_DIR}/boards/*/${BOARD_BASE}/board.overlay")
+if(BOARD_OVERLAY_CANDIDATES)
+    list(GET BOARD_OVERLAY_CANDIDATES 0 ZEPHCORE_BOARD_OVERLAY)
+endif()
+# Fallback: direct path without vendor subdirectory
+if(NOT ZEPHCORE_BOARD_OVERLAY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/board.overlay")
+    set(ZEPHCORE_BOARD_OVERLAY "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/board.overlay")
+endif()
+
+# Append to EXTRA_DTC_OVERLAY_FILE (preserves any user-specified extras)
+if(ZEPHCORE_BOARD_OVERLAY AND EXISTS ${ZEPHCORE_BOARD_OVERLAY})
+    if(EXTRA_DTC_OVERLAY_FILE)
+        set(EXTRA_DTC_OVERLAY_FILE "${EXTRA_DTC_OVERLAY_FILE};${ZEPHCORE_BOARD_OVERLAY}" CACHE STRING "" FORCE)
+    else()
+        set(EXTRA_DTC_OVERLAY_FILE "${ZEPHCORE_BOARD_OVERLAY}" CACHE STRING "" FORCE)
+    endif()
 endif()
 
 # Build the EXTRA_CONF_FILE list (append to any user-provided extras)
@@ -379,22 +472,40 @@ endif()
 # build would light-sleep mid-advertising or mid-connection. repeater.conf
 # sets CONFIG_BT=n, which removes the problem instead of racing it.
 #
-# BOARD ALLOWLIST, not a platform check. Light sleep is only safe where DIO1
-# can wake the SoC, i.e. an RTC-capable pin (GPIO 0-21 on the S3). Every board
-# below wires DIO1 to GPIO14 and consoles on uart0 through a USB-serial bridge,
-# so both the packet wake and the console flush land correctly. Deliberately
-# ABSENT and must stay absent unless their wiring changes:
+# BOARD ALLOWLIST, not a platform check. The hard requirement is DIO1 on an
+# RTC-capable pin (GPIO 0-21 on the S3) so a received packet can wake the SoC.
+# Every board below wires DIO1 to GPIO14. Deliberately ABSENT and must stay
+# absent unless their wiring changes:
 #   xiao_esp32s3 (DIO1=GPIO39), station_g2 (GPIO48), thinknode_m9 (GPIO42),
-#   lilygo_tlora_c6 (GPIO23, outside the C6's LP range 0-7)
+#   lilygo_tlora_c6 (GPIO23, outside the C6's LP range 0-7),
+#   lilygo_t3s3 (GPIO33)
 #     -> cannot wake on a received packet; the node would go deaf while
 #        looking excellent on a current meter.
-#   ttgo_lora32 -> SX127x; patches/zephyr/0012 arms DIO1 in the sx126x driver
-#        only, so nothing marks the pin as a wake source.
-# Boards with a native USB Serial/JTAG console are also unsuitable: the USB
-# peripheral drops off the bus in light sleep and there is no USJ wake source
-# in the HAL (only UART0/1/2 and LP-UART).
+#   ttgo_lora32 -> SX127x; the DIO1 wake flag lives in the sx126x half of
+#        patches/zephyr/0003, so nothing marks the pin as a wake source.
+#
+# CONSOLE, and why it does NOT gate this list. A native USB Serial/JTAG console
+# cannot survive light sleep: the peripheral drops off the bus and the HAL has
+# no USJ wake source (only UART0/1/2 and LP-UART). Of the boards below, only
+# Heltec V3 consoles on a physical uart0 (CP2102). V4, V4.3 and Wireless
+# Tracker V2 choose usb_serial in their board.overlay, and the uart0 reroute in
+# boards/common/esp32s3_usb.overlay is COMPANION-ONLY (the auto-include below
+# excludes repeater/observer/room_server), so a repeater build of those boards
+# keeps a USJ console.
+#
+# The consequence is accepted, not overlooked: on V4/V4.3/WT-V2 the USB CLI
+# stops answering once ZEPHCORE_PM_BOOT_AWAKE_MS expires, and the console flush
+# in helpers/pm_esp32_console.c targets UART0, which is not their console, so it
+# is inert there. Remote admin over LoRa is unaffected, and connecting a
+# terminal normally resets the board (the bridge drives EN from DTR) which
+# re-arms the window. These boards are in the field deliberately to get light
+# sleep exercised; drop them from the regex to take it away.
+#
+# The regex lists v43 explicitly. "heltec_wifi_lora32_v4" already substring-
+# matches it (CMake MATCHES is unanchored), which made V4.3's inclusion look
+# accidental; spelling it out makes the intent reviewable.
 if(ZEPHCORE_PLATFORM_CONF MATCHES "esp32_common" AND EXTRA_CONF_FILE MATCHES "repeater"
-   AND BOARD MATCHES "heltec_wifi_lora32_v3|heltec_wifi_lora32_v4|heltec_wireless_tracker")
+   AND BOARD MATCHES "heltec_wifi_lora32_v3|heltec_wifi_lora32_v4|heltec_wifi_lora32_v43|heltec_wireless_tracker")
     set(ZEPHCORE_PM_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/pm_esp32.conf")
     if(EXISTS ${ZEPHCORE_PM_CONF})
         list(APPEND ZEPHCORE_CONF_FILES ${ZEPHCORE_PM_CONF})
@@ -410,6 +521,51 @@ if(ZEPHCORE_PLATFORM_CONF MATCHES "esp32_common" AND EXTRA_CONF_FILE MATCHES "re
         list(APPEND ZEPHCORE_CONF_FILES ${ZEPHCORE_WIFI_OTA_CONF})
         zephcore_auto_pair_overlay("${ZEPHCORE_WIFI_OTA_CONF}")
         message(STATUS "  WiFi OTA: auto-enabled (ESP32 repeater)")
+    endif()
+endif()
+
+# Auto-include the ESP32-S3 USB CDC-ACM companion transport.
+#
+# The policy lives here rather than in build.sh so that a locally built
+# companion is the same firmware as the published release.  The ESP32 release
+# flow already diverges from a plain build in its *layout* (sysbuild/MCUboot);
+# letting it diverge in which *transports* the app speaks as well would make
+# user bug reports unreproducible from source.
+#
+# Detection is the board's own devicetree, not a name list: a board that
+# includes esp32s3_usb_otg.dtsi has declared the cdc_acm_uart node, which is
+# exactly the precondition the USB companion call sites are compiled behind
+# (see ZEPHCORE_USB_STACK in src/main_companion.cpp).  Boards without it are
+# skipped automatically -- Heltec V3 (USB-C via CP2102, uses
+# serial_companion.conf), Wireless Tracker V1, and every C3/C6/classic-ESP32
+# part, which has no DWC2 controller at all.
+#
+# COMPANION ROLE ONLY.  esp32s3_usb.conf sets CONFIG_ZEPHCORE_COMPANION_USB=y,
+# which carries no role dependency of its own, and its paired overlay moves the
+# console to uart0.  In a repeater/observer/room-server build that would both
+# compile the companion USB stack and strand the serial CLI on GPIO43/44.
+# serial_companion.conf is excluded for a different reason: COMPANION_SERIAL
+# `depends on !COMPANION_USB`, so adding this would silently disable it.
+#
+# DEBUG BUILDS ARE EXCLUDED.  ESP32 has no RTT (debug_esp32.conf routes logs to
+# the console backend) and this conf hands that USB port to the binary
+# companion protocol, so an auto-enabled debug build would have nowhere to log.
+# Pass both confs explicitly to debug the USB transport itself; logs then need
+# a UART adapter on GPIO43/44.
+if(ZEPHCORE_PLATFORM_CONF MATCHES "esp32_common" AND ZEPHCORE_BOARD_CONF
+   AND NOT EXTRA_CONF_FILE MATCHES "repeater|observer|room_server|serial_companion|esp32s3_usb|debug")
+    get_filename_component(ZEPHCORE_BOARD_DIR "${ZEPHCORE_BOARD_CONF}" DIRECTORY)
+    if(EXISTS "${ZEPHCORE_BOARD_DIR}/board.overlay")
+        file(READ "${ZEPHCORE_BOARD_DIR}/board.overlay" ZEPHCORE_BOARD_OVERLAY_TEXT)
+        if(ZEPHCORE_BOARD_OVERLAY_TEXT MATCHES "esp32s3_usb_otg\\.dtsi")
+            set(ZEPHCORE_USB_CONF "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/esp32s3_usb.conf")
+            if(EXISTS ${ZEPHCORE_USB_CONF})
+                list(APPEND ZEPHCORE_CONF_FILES ${ZEPHCORE_USB_CONF})
+                zephcore_auto_pair_overlay("${ZEPHCORE_USB_CONF}")
+                message(STATUS "  USB CDC companion: auto-enabled (board declares USB OTG CDC-ACM)")
+            endif()
+        endif()
+        unset(ZEPHCORE_BOARD_OVERLAY_TEXT)
     endif()
 endif()
 
@@ -446,26 +602,6 @@ if(EXTRA_CONF_FILE)
 endif()
 
 # ========== DTC Overlay Hierarchy ==========
-# Search for board.overlay in possible locations (same as board.conf)
-set(ZEPHCORE_BOARD_OVERLAY "")
-file(GLOB_RECURSE BOARD_OVERLAY_CANDIDATES "${CMAKE_CURRENT_SOURCE_DIR}/boards/*/${BOARD_BASE}/board.overlay")
-if(BOARD_OVERLAY_CANDIDATES)
-    list(GET BOARD_OVERLAY_CANDIDATES 0 ZEPHCORE_BOARD_OVERLAY)
-endif()
-# Fallback: direct path without vendor subdirectory
-if(NOT ZEPHCORE_BOARD_OVERLAY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/board.overlay")
-    set(ZEPHCORE_BOARD_OVERLAY "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/board.overlay")
-endif()
-
-# Append to EXTRA_DTC_OVERLAY_FILE (preserves any user-specified extras)
-if(ZEPHCORE_BOARD_OVERLAY AND EXISTS ${ZEPHCORE_BOARD_OVERLAY})
-    if(EXTRA_DTC_OVERLAY_FILE)
-        set(EXTRA_DTC_OVERLAY_FILE "${EXTRA_DTC_OVERLAY_FILE};${ZEPHCORE_BOARD_OVERLAY}" CACHE STRING "" FORCE)
-    else()
-        set(EXTRA_DTC_OVERLAY_FILE "${ZEPHCORE_BOARD_OVERLAY}" CACHE STRING "" FORCE)
-    endif()
-endif()
-
 # Flash partition layout lives in a separate boards/<...>/<board>/partitions.overlay
 # so the SAME file can be fed to the MCUboot image too (see sysbuild/CMakeLists.txt).
 # The app and MCUboot MUST share one flash map — otherwise MCUboot stages/looks for
@@ -525,7 +661,7 @@ add_definitions(-DFIRMWARE_BUILD_EPOCH=${ZEPHCORE_BUILD_EPOCH}u)
 # release is tagged/named, and what the Mesh America catalog uses as its version
 # key — so the configurator can match a running device against the catalog. Keep
 # all four identical; the release workflow reads this value directly.
-set(ZEPHCORE_FIRMWARE_VERSION "1.16.8-zephcore")
+set(ZEPHCORE_FIRMWARE_VERSION "1.17.4-zephcore")
 add_definitions(-DFIRMWARE_VERSION="${ZEPHCORE_FIRMWARE_VERSION}")
 
 add_subdirectory(lib/monocypher)
@@ -571,6 +707,15 @@ target_sources(app PRIVATE
   # LED master gate ("set leds on|off"). Always compiled: helpers/ui/ui_common.c
   # only exists in UI builds, but a headless repeater still drives lora-tx-led.
   helpers/led_gate.c
+  # Notification-mode gate. Same reason as led_gate: the CLI needs these
+  # symbols on boards that compile no buzzer at all.
+  helpers/buzzer_gate.c
+  # QSPI bring-up probe. Self-stubs unless CONFIG_ZEPHCORE_QSPI_RDID_PROBE.
+  helpers/qspi_probe.c
+  # Factory format of every storage region. Compiled for all roles: the
+  # companion builds ZephyrDataStore, the other three build
+  # RepeaterDataStore, and both call into this.
+  adapters/datastore/ZephyrFsFormat.c
 )
 
 # Boot-time hardware-RTC auto-discovery (compact raw-I2C). Always compiled so
@@ -578,6 +723,14 @@ target_sources(app PRIVATE
 # when CONFIG_ZEPHCORE_RTC_AUTODISCOVER is off or no zephcore,rtc-i2c node is
 # present in DT.
 target_sources(app PRIVATE adapters/clock/ZephyrRTCDiscover.c)
+
+# SPA06-003 barometer. No upstream Zephyr driver; compiles to nothing when no
+# goertek,spa06 node is present.
+target_sources_ifdef(CONFIG_SENSOR app PRIVATE adapters/sensors/spa06.c)
+
+# T1000-E onboard NTC + photocell on the SAADC. Same deal: compiles to nothing
+# when no seeed,t1000e-analog node is present.
+target_sources_ifdef(CONFIG_SENSOR app PRIVATE adapters/sensors/t1000e_analog.c)
 
 # ========== Battery Curve Selection ==========
 # helpers/battery_curve.c is always compiled — it provides battery_curve_lookup()
@@ -876,6 +1029,7 @@ endif()
 if(CONFIG_ZEPHCORE_UI_BUZZER)
   target_sources(app PRIVATE
     helpers/ui/buzzer.c
+    helpers/ui/haptic.c
   )
 endif()
 

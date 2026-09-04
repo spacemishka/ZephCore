@@ -29,6 +29,17 @@ extern "C" {
  */
 int16_t lr11xx_get_rssi_inst(const struct device *dev);
 
+/* Read n RSSI samples spaced spacing_us apart, bracketing the duty-cycle
+ * stand-down ONCE for the whole burst instead of once per sample.  Returns the
+ * number of valid samples written; fewer than n means the read was refused
+ * partway and the caller should discard the burst.  A NEGATIVE return (-EAGAIN)
+ * means discard for a different reason: the receiver detected a preamble or
+ * header inside the window, so the samples describe that signal rather than the
+ * noise floor.  The two are worth distinguishing -- one indicts the sampler,
+ * the other reports the channel. */
+int lr11xx_get_rssi_burst(const struct device *dev, int16_t *out, int n,
+			 uint32_t spacing_us);
+
 /**
  * @brief Check if radio is actively receiving a packet
  *
@@ -64,6 +75,28 @@ void lr11xx_set_rx_boost(const struct device *dev, bool enable);
 uint32_t lr11xx_get_wakeup_time_us(const struct device *dev);
 
 /**
+ * @brief Duty-cycle re-arms caused by a timeout since boot or reset
+ *
+ * Counts the false-preamble case: UM §7.2.6 restarts the window timer with
+ * 2*RxPeriod + SleepPeriod on preamble detection, and when that expires with no
+ * packet the chip leaves the loop and the driver puts it back.  A climbing rate
+ * means the RX window is catching noise rather than packets.  Backs
+ * `get dc.restarts`, which reported a hardcoded 0 on this radio before anything
+ * counted them.
+ *
+ * @param dev LoRa device
+ * @return re-arm count
+ */
+uint32_t lr11xx_get_dc_timeout_restarts(const struct device *dev);
+
+/**
+ * @brief Clear the duty-cycle timeout re-arm counter
+ *
+ * @param dev LoRa device
+ */
+void lr11xx_reset_dc_timeout_restarts(const struct device *dev);
+
+/**
  * @brief Get a random number from the radio
  *
  * Uses LR11xx hardware RNG.
@@ -74,17 +107,25 @@ uint32_t lr11xx_get_wakeup_time_us(const struct device *dev);
 uint32_t lr11xx_get_random(const struct device *dev);
 
 /**
- * @brief Reset AGC by performing warm sleep + full recalibration
+ * @brief Redo the frequency-dependent calibrations (temperature drift path).
  *
- * Warm sleep powers down the analog frontend (resets AGC gain state),
- * then Calibrate(0x3F) refreshes all blocks. Re-applies image
- * calibration for the operating frequency and RX boost afterward.
+ * Warm sleep, Calibrate(ALL) — which on this part already includes image
+ * rejection — then image calibration at the operating frequency and a rx-boost
+ * re-apply.  Deliberately NOT an AGC reset: that fault, and its remedy, belong
+ * to the SX126x.  Defers if the chip is busy (duty-cycle sleep).
  *
- * Must be called while NOT actively receiving a packet.
+ * Leaves the driver out of RX — the caller must startReceive() afterwards.
  *
  * @param dev LoRa device
  */
-void lr11xx_reset_agc(const struct device *dev);
+void lr11xx_recalibrate(const struct device *dev);
+
+/**
+ * @brief Junction temperature in whole degrees C, or INT16_MIN if unavailable.
+ *
+ * @param dev LoRa device
+ */
+int16_t lr11xx_get_chip_temp_c(const struct device *dev);
 
 /**
  * @brief Set the adaptive-CAD operating detPeak offset
@@ -102,9 +143,27 @@ void lr11xx_cad_set_peak_offset(const struct device *dev, int8_t offset);
  * @brief Per-SF base cadDetPeak for the currently configured SF
  *
  * @param dev LoRa device
- * @return Base detPeak (56-68 on this family)
+ * @return Base detPeak for the current SF, bandwidth and CAD symbol count
+ *         (roughly 50-85 on this family; strongly bandwidth-dependent)
  */
 uint8_t lr11xx_cad_base_peak(const struct device *dev);
+
+/**
+ * @brief Lowest detPeak this driver will program.
+ *
+ * The C++ adaptive-CAD controller narrows its offset window to this range so it
+ * never explores offsets that collapse onto one peak.
+ *
+ * @return Minimum absolute detPeak
+ */
+uint8_t lr11xx_cad_peak_min(void);
+
+/**
+ * @brief Highest detPeak this driver will program.
+ *
+ * @return Maximum absolute detPeak
+ */
+uint8_t lr11xx_cad_peak_max(void);
 
 /**
  * @brief Run one blocking calibration CAD at base detPeak + peak_offset
@@ -117,7 +176,24 @@ uint8_t lr11xx_cad_base_peak(const struct device *dev);
  * @param peak_offset Signed offset from the base table value
  * @return 1 = activity detected, 0 = channel free, <0 = error
  */
+/* Armed with the CAD_RX exit mode: a NEGATIVE CAD exits to standby and the
+ * caller must restart Rx, a POSITIVE one leaves the chip in Rx on the signal it
+ * detected and the caller must not.
+ * Returns 2 = detected, chip in Rx (see lr11xx_cad_rx_outcome());
+ *         0 = channel free, chip in standby; <0 = error. */
 int lr11xx_cad_probe(const struct device *dev, int8_t peak_offset);
+
+/* Outcome of the Rx a positive lr11xx_cad_probe() entered.  The chip always
+ * resolves it with a terminal interrupt, so this reports an observed event
+ * rather than an inference.  Call once after the cad_timeout deadline; it
+ * consumes the result.
+ * Returns 1 = a packet arrived (detection was real);
+ *         2 = cad_timeout expired with nothing decoded;
+ *         0 = nothing armed, or the terminal interrupt has not arrived yet. */
+int lr11xx_cad_rx_outcome(const struct device *dev);
+
+/* The cad_timeout a CAD_RX probe programs, in milliseconds. */
+uint32_t lr11xx_cad_rx_timeout_ms(const struct device *dev);
 
 #ifdef __cplusplus
 }

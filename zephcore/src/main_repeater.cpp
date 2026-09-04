@@ -50,6 +50,7 @@ extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
 #endif
 
 #include <app/RepeaterDataStore.h>
+#include "../adapters/datastore/ZephyrFsFormat.h"
 #include <app/RepeaterMesh.h>
 #include <adapters/clock/ZephyrRTCClock.h>
 #include <adapters/clock/ZephyrRTCDiscover.h>
@@ -57,6 +58,9 @@ extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
 
 /* UI subsystem (display, buttons, buzzer) */
 #include "ui_task.h"
+#if IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
+#include "display.h"
+#endif
 
 /* Headless repeaters link the weak no-op ui_* stubs (ui_headless_stubs.c), so
  * the periodic UI refresh in the maintenance pass is pure work for nothing on
@@ -143,6 +147,10 @@ static struct ring_buf usb_ring_buf;
 static char cli_line_buf[CLI_LINE_BUF_SIZE];
 static char cli_reply_buf[256];
 static uint16_t cli_line_idx;
+/* Last byte seen by cli_rx_work_fn, for collapsing CRLF/LFCR pairs. Persists
+ * across work-item invocations, so a pair split across two USB packets still
+ * compares correctly. */
+static uint8_t cli_prev_byte;
 
 /* Completed CLI lines are handed to the MAIN thread for execution.  Byte
  * assembly + echo (cli_rx_work_fn) runs on sysworkq and touches no mesh
@@ -206,31 +214,43 @@ static void cli_rx_work_fn(struct k_work *work)
 	uint8_t byte;
 
 	while (ring_buf_get(&usb_ring_buf, &byte, 1) == 1) {
-		/* Process command on \r OR \n (support echo from Linux) */
-		if (byte == '\r' || byte == '\n') {
-			if (cli_line_idx > 0) {
-				cli_line_buf[cli_line_idx] = '\0';
+		const uint8_t prev = cli_prev_byte;
+		cli_prev_byte = byte;
 
-				/* Debug: log received command */
+		/* Process command on \r OR \n. Accepting both is what makes a piped
+		 * `echo "cmd" > /dev/ttyACM0` (LF only) work. The cost is that a CRLF
+		 * terminal sends two terminator bytes per Enter, so collapse the pair
+		 * here: skip a terminator that directly follows a *different* one.
+		 * "\r\r" and "\n\n" (two genuine blank lines) still dispatch twice.
+		 * Blank lines ARE dispatched -- `region load` commits on one, and
+		 * handleCommand() no-ops a blank line otherwise. The previous
+		 * de-duplicator keyed on an empty line buffer instead: it ate every
+		 * blank line (stranding `region load` until a reboot) and still let
+		 * the CRLF tail fall through and emit a stray newline of its own. */
+		if (byte == '\r' || byte == '\n') {
+			if ((prev == '\r' || prev == '\n') && byte != prev) {
+				continue;   /* tail of a CRLF/LFCR pair */
+			}
+			cli_line_buf[cli_line_idx] = '\0';
+
+			/* Debug: log received command */
+			if (cli_line_idx > 0) {
 				LOG_INF("CLI cmd len=%d: %.40s%s", cli_line_idx,
 					cli_line_buf, cli_line_idx > 40 ? "..." : "");
-
-				/* Hand the command to the main thread (see cli_cmd_queue).
-				 * The reply + trailing newline are emitted there, exactly
-				 * matching the previous inline output order. */
-				struct cli_cmd_line c;
-				strncpy(c.buf, cli_line_buf, sizeof(c.buf) - 1);
-				c.buf[sizeof(c.buf) - 1] = '\0';
-				if (k_msgq_put(&cli_cmd_queue, &c, K_NO_WAIT) == 0) {
-					k_event_post(&mesh_events, MESH_EVENT_CLI_RX);
-				} else {
-					cli_print("\r\n  -> busy\r\n");
-				}
-				cli_line_idx = 0;
-			} else {
-				/* Empty line — just emit the newline (no command to run) */
-				cli_print("\r\n");
 			}
+
+			/* Hand the command to the main thread (see cli_cmd_queue).
+			 * The reply + trailing newline are emitted there, exactly
+			 * matching the previous inline output order. */
+			struct cli_cmd_line c;
+			strncpy(c.buf, cli_line_buf, sizeof(c.buf) - 1);
+			c.buf[sizeof(c.buf) - 1] = '\0';
+			if (k_msgq_put(&cli_cmd_queue, &c, K_NO_WAIT) == 0) {
+				k_event_post(&mesh_events, MESH_EVENT_CLI_RX);
+			} else {
+				cli_print("\r\n  -> busy\r\n");
+			}
+			cli_line_idx = 0;
 		} else if (byte == 0x7F || byte == 0x08) {
 			/* Backspace - echo backspace sequence */
 			if (cli_line_idx > 0) {
@@ -422,6 +442,10 @@ static uint16_t get_battery_mv(void)
 /* LR1110 via Zephyr LoRa driver */
 static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
 static mesh::LR1110Radio lora_radio(lora_dev, zephyr_board);
+#elif IS_ENABLED(CONFIG_ZEPHCORE_RADIO_LR2021)
+/* LR2021 via Zephyr LoRa driver */
+static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
+static mesh::LR2021Radio lora_radio(lora_dev, zephyr_board);
 #elif IS_ENABLED(CONFIG_ZEPHCORE_RADIO_SX127X)
 /* SX127x via Zephyr loramac-node driver */
 static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
@@ -636,6 +660,24 @@ int main(void)
 	}
 #endif
 
+	/* First boot on a volume that is not this role's - a fresh chip, a
+	 * companion, or a node that was running Arduino MeshCore, whose nRF52
+	 * filesystems overlap our lfs_partition
+	 * (devdocs/HANDOVER_lfs_arduino_overlap.md).  Erase everything so we
+	 * start from a known state: Zephyr's automount only
+	 * auto-formats the LittleFS volume when it fails to mount, and never
+	 * touches storage_partition (BLE bonds NVS) or QSPI.
+	 *
+	 * Self-limiting, so it needs no "done" marker: the identity is generated
+	 * and saved a few lines below, and loadPrefs() persists defaults on the
+	 * same boot, so the next boot sees this role's data and skips this. */
+	if (!data_store.hasRoleData()) {
+		LOG_WRN("Volume holds no data for this role - formatting before first boot");
+		if (!zephcore_fs_format_all(nullptr)) {
+			LOG_ERR("First-boot format failed - /lfs is not mounted");
+		}
+	}
+
 	/* Initialize repeater data store */
 	if (!data_store.begin()) {
 		LOG_ERR("RepeaterDataStore init failed");
@@ -670,15 +712,6 @@ int main(void)
 #if !IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
 	oled_sleep();
 #endif
-
-	/* Apply the persisted LED master switch ("set leds on|off"). After ui_init()
-	 * so the heartbeat cycle exists to be stopped; before the radio starts so the
-	 * first transmit already honours it. */
-	{
-		bool leds_off = repeater_mesh.getNodePrefs()->leds_disabled != 0;
-		zephcore_leds_set_disabled(leds_off);
-		LOG_INF("LEDs: %s (from prefs)", leds_off ? "disabled" : "enabled");
-	}
 
 	/* Log environment sensor availability */
 	if (env_sensors_available()) {
@@ -725,6 +758,26 @@ int main(void)
 	data_store.loadPrefs(*repeater_mesh.getNodePrefs());
 	lora_radio.setPrefs(repeater_mesh.getNodePrefs());
 
+	/* Apply the persisted LED master switch ("set leds on|off").  MUST come
+	 * after loadPrefs(): this used to sit just after ui_init(), ~45 lines
+	 * earlier, where getNodePrefs() still held the initNodePrefs() default of
+	 * leds_disabled=0.  A node with "off" persisted therefore opened the gate on
+	 * every boot and never closed it again -- `get leds` read the (correct) RAM
+	 * prefs and said "off" while the LEDs kept blinking, until the user issued
+	 * `set leds off` a second time to drive the gate directly.  The other two
+	 * ordering constraints still hold here: ui_init() has already run, so the
+	 * heartbeat cycle exists to be stopped, and repeater_mesh.begin() ->
+	 * Dispatcher::begin() -> Radio::begin() is still below, so the first
+	 * transmit honours it. */
+	{
+		const NodePrefs *lp = repeater_mesh.getNodePrefs();
+		bool leds_off = lp->leds_disabled != 0;
+		zephcore_leds_set_disabled(leds_off);
+		zephcore_leds_set_radio_mode(lp->leds_radio_mode);
+		zephcore_leds_set_hb_mode(lp->leds_hb_mode);
+		LOG_INF("LEDs: %s (from prefs)", leds_off ? "disabled" : "enabled");
+	}
+
 	/* Start mesh with data store - loads ACL, regions */
 	repeater_mesh.begin(&data_store);
 
@@ -741,9 +794,45 @@ int main(void)
 
 	/* Apply RX boost and duty cycle from prefs */
 	lora_radio.setRxBoost(prefs->rx_boost != 0);
+	lora_radio.setFemRxEnable(prefs->fem_rxgain != 0);
 	lora_radio.enableRxDutyCycle(prefs->rx_duty_cycle != 0);
 	lora_radio.setCadParams(prefs->cad_auto != 0, prefs->cad_offset,
-				prefs->probe_interval, prefs->cad_busycap);
+				prefs->probe_interval, prefs->cad_busycap,
+				prefs->cad_base);
+	/* Write back the (offset, base) actually in force.  setCadParams() may
+	 * have re-anchored the offset across a base-table change, and the pair
+	 * has to be persisted for the NEXT upgrade to have an anchor of its own.
+	 * Guarded so a node whose base has not moved never writes flash at boot. */
+	if (prefs->cad_base != lora_radio.cadBasePeak() ||
+	    prefs->cad_offset != lora_radio.getCadOffset()) {
+		prefs->cad_offset = lora_radio.getCadOffset();
+		prefs->cad_base = lora_radio.cadBasePeak();
+		repeater_mesh.savePrefs();
+	}
+
+	/* LR2021 side detectors (multi-SF RX) from prefs.  extra_sf is a
+	 * zero-terminated list; a rejected set (SF/BW changed since it was
+	 * saved) just leaves the feature off, and non-LR2021 radios report it
+	 * unsupported. */
+	{
+		uint8_t n = 0;
+		while (n < EXTRA_SF_MAX && prefs->extra_sf[n] != 0) n++;
+		if (n > 0 && !lora_radio.configSideDetectors(prefs->extra_sf, n)) {
+			LOG_WRN("extra.sf %u SFs rejected for current SF/BW — side detectors off", n);
+		}
+	}
+
+	/* Physical mounting orientation, from prefs.  Both are immediate and
+	 * cheap: the panel rotation is a two-byte SEGMENT_MAP/COM_SCAN remap and
+	 * the axis swap is a flag the input callbacks read per event.  A panel
+	 * that cannot rotate logs a warning and stays in its native orientation
+	 * rather than failing the boot. */
+	zephcore_input_set_flipped(prefs->input_rotate != 0);
+#if IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
+	if (prefs->display_rotate) {
+		mc_display_set_rotated(true);
+	}
+#endif
 
 	/* Feed initial UI state from loaded prefs */
 	ui_set_node_name(prefs->node_name);

@@ -46,12 +46,28 @@ public:
     /* Apply RX boosted gain live; returns false when the radio has no
      * RX boost feature (upstream PR #2844 semantics). */
     virtual bool setRxBoostedGain(bool enable) { (void)enable; return false; }
+    /* Gate an external FEM/LNA in the RX direction, live.  Same semantics:
+     * false means the radio driver has no such knob.  On a supported radio
+     * whose board has no FEM wired it returns true and does nothing. */
+    virtual bool setFemRxGain(bool enable) { (void)enable; return false; }
+    /* Configure LR2021 side detectors (multi-SF receive); num = 0 disables.
+     * Returns false when the radio has no side detectors, or when the set
+     * violates a chip constraint — the driver is the validator. */
+    virtual bool configSideDetectors(const uint8_t* sfs, uint8_t num) {
+        (void)sfs; (void)num; return false;
+    }
     /* Repeater-specific — default replies keep companion builds clean.
      * Repeater overrides all four; companions get "not available". */
     virtual void formatNeighborsReply(char* reply)      { strcpy(reply, "not available"); }
     virtual void removeNeighbor(const uint8_t* pubkey, int key_len) {
         (void)pubkey; (void)key_len;
     }
+    /* True when the companion transport has nothing left to deliver: TX queue
+     * drained AND no delivery-ack still held back.  Reboot-class commands poll
+     * this before resetting so the reply and its ack are not cut off by the
+     * reset they just scheduled.  Default true — the repeater's LoRa reply is
+     * covered by the fixed pre-reboot delay instead. */
+    virtual bool transportTxIdle() { return true; }
     virtual void formatStatsReply(char* reply)           { strcpy(reply, "not available"); }
     virtual void formatRadioStatsReply(char* reply)      { strcpy(reply, "not available"); }
     virtual void formatPacketStatsReply(char* reply)     { strcpy(reply, "not available"); }
@@ -76,6 +92,9 @@ public:
 
     // Adaptive CAD (LBT detPeak calibration)
     virtual int formatCadStatus(char* buf, int cap) { (void)buf; (void)cap; return 0; }
+    /* Carrier frequency error accumulated from received packets; 0 = this
+     * radio cannot measure it (only the LR2021 does today). */
+    virtual int formatFreqErrorStatus(char* buf, int cap) { (void)buf; (void)cap; return 0; }
     virtual void applyCadPrefs() {}
     virtual void resetCadStats() {}
 
@@ -110,6 +129,9 @@ class CommonCLI {
     /* Deferred reboot - lets LoRa reply be sent before rebooting */
     struct k_work_delayable _reboot_work;
     uint8_t _pending_reboot;
+    /* Uptime (ms) past which the reboot goes ahead even if the transport is
+     * still busy — a stalled or dropped link must not wedge the reset. */
+    int64_t _reboot_deadline_ms;
     static void rebootWorkHandler(struct k_work *work);
 
     mesh::RTCClock* getRTCClock() { return _rtc; }
@@ -120,13 +142,11 @@ public:
     CommonCLI(mesh::MainBoard& board, mesh::RTCClock& rtc, ClientACL& acl,
               NodePrefs* prefs, CommonCLICallbacks* callbacks)
         : _board(&board), _rtc(&rtc), _acl(&acl), _prefs(prefs), _callbacks(callbacks),
-          _pending_reboot(REBOOT_NONE)
+          _pending_reboot(REBOOT_NONE), _reboot_deadline_ms(0)
     {
         k_work_init_delayable(&_reboot_work, rebootWorkHandler);
     }
 
-    void loadPrefs(const char* path);
-    void savePrefs(const char* path);
     void handleCommand(uint32_t sender_timestamp, const char* command, char* reply);
     uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
 };

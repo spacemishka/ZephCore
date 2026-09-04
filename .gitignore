@@ -73,8 +73,10 @@ rtt_*.txt
 # JLink scripts and outputs
 *.jlink
 
-# Documentation that was moved/deleted
-/docs/
+# Internal working docs: per-topic audit indexes, handovers, handoffs, and
+# other local-only scratch notes (see the HANDOVER_*/​*_AUDIT_INDEX rules below,
+# kept for pre-2026-08-24 history/muscle memory even though this covers them).
+/devdocs/
 
 # Temporary/scratch files
 *.tmp
@@ -105,6 +107,16 @@ WEST_UPDATE.md
 /doom/
 THINKNODE_M1_HANDOVER.md
 CLAUDE.md
+# Working docs at the workspace root are local-only: per-topic audit indexes,
+# handovers and handoffs.  These were listed one file at a time, which meant
+# every new one had to be remembered — and one was not, so it went into a commit
+# before anybody noticed.  Match by shape instead; the individual lines below are
+# now redundant but harmless.
+[Hh][Aa][Nn][Dd][Oo][Vv][Ee][Rr]_*.md
+*_AUDIT_INDEX.md
+*_AUDIT_HANDOFF.md
+*_HANDOFF.md
+
 zephcore/apc_checklist.md
 RADIO_AUDIT_INDEX.md
 RX_BUSY_LATCH_PLAN.md
@@ -124,6 +136,7 @@ UI_AUDIT_INDEX.md
 RADIO2_AUDIT_INDEX.md
 MISC_AUDIT_INDEX.md
 HANDOVER_issue34_ble_esp32.md
+HANDOVER_crypto_hw_accel.md
 PATH_HASH_AUDIT_INDEX.md
 MESHTIMESYNC_PLAN.md
 /meshtimesync-sim/
@@ -136,3 +149,16 @@ MESHTIMESYNC_PLAN.md
 releasenotes/RELEASE_NOTES_1.16.3-zephcore.md
 releasenotes/RELEASE_NOTES_1.16.4-zephcore.md
 handover_thinknode_m9.md
+
+# Vendor reference docs (datasheets, errata). Local only — not ours to redistribute.
+/datasheets/
+LR2021_AUDIT_INDEX.md
+HANDOVER_lr2021_audit.md
+
+# LR2021 bring-up scratch: the CAD_LBT revert patch and its measurement notes.
+# Local only, like the audit index and handover above.  Ignore the whole
+# directory — per-file rules were tried and could not work, because .gitignore
+# does not apply to paths already in the index (three of these went into
+# b839c2c for exactly that reason; untrack with `git rm -r --cached`).
+lr2021_bench/
+LR2021_MATH_AUDIT.md

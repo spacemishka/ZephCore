@@ -21,6 +21,7 @@
 #include <helpers/CommonCLI.h>
 #include <helpers/MeshTimeSync.h>
 #include <helpers/RegionMap.h>
+#include <helpers/RoutingPolicy.h>
 #include <helpers/TransportKeyStore.h>
 #include <helpers/RateLimiter.h>
 #include <helpers/StatsFormatHelper.h>
@@ -79,6 +80,11 @@ class RoomServerMesh : public mesh::Mesh, public CommonCLICallbacks {
     RegionMap region_map, temp_map;
     RegionEntry* load_stack[8];
     RegionEntry* recv_pkt_region;
+    /* A null recv_pkt_region has two meanings — a DIRECT request (no transport
+     * codes at all) and an un-scoped flood our wildcard Region denies — and
+     * sendFloodReply() must treat them differently, so record the route type
+     * rather than inferring it from the pointer. */
+    bool recv_pkt_unscoped_flood;
     TransportKey default_scope;
     RateLimiter login_fail_limiter;
     bool region_load_active;
@@ -114,10 +120,10 @@ class RoomServerMesh : public mesh::Mesh, public CommonCLICallbacks {
     void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);
     void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
 
-    /* Region-definition CLI (defined in app/RepeaterRegionCLI.cpp).
+    /* Region-definition CLI (defined in app/RoomServerRegionCLI.cpp).
      * handleRegionLoadLine: a continuation line during `region load`.
      * handleRegionCommand:  a `region ...` command. */
-    void handleRegionLoadLine(char* command, char* reply);
+    void handleRegionLoadLine(uint32_t sender_timestamp, char* command, char* reply);
     void handleRegionCommand(char* command, char* reply);
 
 protected:
@@ -144,12 +150,18 @@ protected:
     }
 
     /* Adaptive CAD */
+    int formatFreqErrorStatus(char* buf, int cap) override {
+        return _radio->formatFreqErrorStatus(buf, cap);
+    }
     int formatCadStatus(char* buf, int cap) override {
         return _radio->formatCadStatus(buf, cap);
     }
     void applyCadPrefs() override {
         _radio->setCadParams(_prefs.cad_auto != 0, _prefs.cad_offset,
-                             _prefs.probe_interval, _prefs.cad_busycap);
+                             _prefs.probe_interval, _prefs.cad_busycap,
+                             _prefs.cad_base);
+        _prefs.cad_offset = _radio->getCadOffset();
+        _prefs.cad_base = _radio->cadBasePeak();
     }
     void resetCadStats() override {
         _radio->resetCadStats();
@@ -203,6 +215,8 @@ public:
     void dumpLogFile() override;
     void setTxPower(int8_t power_dbm) override;
     bool setRxBoostedGain(bool enable) override;
+    bool setFemRxGain(bool enable) override;
+    bool configSideDetectors(const uint8_t* sfs, uint8_t num) override;
     void formatNeighborsReply(char* reply) override;
     void formatStatsReply(char* reply) override;
     void formatRadioStatsReply(char* reply) override;

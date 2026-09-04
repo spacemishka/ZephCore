@@ -7,6 +7,7 @@
  */
 
 #include "ZephyrDataStore.h"
+#include "ZephyrFsFormat.h"
 #include <AdvertDataHelpers.h>   // ADV_TYPE_NONE (transient/anon contacts)
 #include <zephyr/fs/fs.h>
 #include <zephyr/fs/littlefs.h>
@@ -38,7 +39,19 @@ static bool atomicWriteTempFile(const char *path, AtomicWriteFn write_fn, void *
 		return false;
 	}
 
-	fs_unlink(tmp_path);
+	/* Best-effort cleanup of a leftover temp from an interrupted write.
+	 *
+	 * Guarded by fs_stat rather than unlinking blind: on the normal path the
+	 * file does not exist, fs_unlink() returns -ENOENT, and Zephyr's FS layer
+	 * logs that at ERR level regardless of us ignoring the return.  That put
+	 * an <err> line on the happy path of every atomic save — 23 of them in a
+	 * 90-minute capture, one per save — which is exactly the noise that makes
+	 * a real filesystem error invisible. */
+	struct fs_dirent tmp_ent;
+
+	if (fs_stat(tmp_path, &tmp_ent) == 0) {
+		fs_unlink(tmp_path);
+	}
 
 	struct fs_file_t file;
 	fs_file_t_init(&file);
@@ -75,11 +88,32 @@ static bool atomicWriteTempFile(const char *path, AtomicWriteFn write_fn, void *
 static bool lfs_mounted;
 static bool ext_lfs_mounted;
 
-/* Check if a filesystem is mounted using fs_statvfs */
+/* Check if a filesystem is mounted (mount-list lookup, never logs) */
 static bool is_mounted(const char *mount_point)
 {
-	struct fs_statvfs stat;
-	return fs_statvfs(mount_point, &stat) == 0;
+	/* Walk the registered mount list rather than calling fs_statvfs().
+	 *
+	 * fs_statvfs() on a path that is not mounted makes Zephyr's FS layer log
+	 * "mount point not found!!" at ERR, which put an <err> line on the happy
+	 * path of every boot: on boards with no external flash (the probe can
+	 * never succeed) and, on boards that do have it, on every boot before the
+	 * deferred-init retry below mounts it.
+	 *
+	 * Deliberately NOT solved by gating the probe on
+	 * DT_NODE_EXISTS(DT_NODELABEL(qspi_lfs)): that would still log on the
+	 * deferred-init path, and it would silently stop detecting /ext on any
+	 * future board that mounts external flash under a different node label.
+	 * fs_readmount() is a pure lookup, logs nothing, and stays correct in
+	 * every one of those permutations. */
+	int index = 0;
+	const char *name = NULL;
+
+	while (fs_readmount(&index, &name) == 0) {
+		if (name != NULL && strcmp(name, mount_point) == 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool ZephyrDataStore::mount()
@@ -110,6 +144,25 @@ bool ZephyrDataStore::mount()
 		 * on /ext.  Without this the store silently falls back to internal /lfs,
 		 * and the next boot that does mount /ext runs a needless contact
 		 * migration — the "Migrating contacts to external storage" churn. */
+#if DT_NODE_HAS_PROP(DT_COMPAT_GET_ANY_STATUS_OKAY(nordic_qspi_nor), zephyr_deferred_init)
+		/* The flash is deferred-init: probing it at boot raced its own
+		 * power rail and the JEDEC read came back 00 00 00, so the
+		 * driver failed and /ext could never mount. Initialising it here
+		 * instead means the part has had until first use to wake up —
+		 * over a second — rather than us guessing a settling delay. */
+		{
+			const struct device *qspi_dev =
+				DEVICE_DT_GET(DT_COMPAT_GET_ANY_STATUS_OKAY(nordic_qspi_nor));
+
+			if (!device_is_ready(qspi_dev)) {
+				int drc = device_init(qspi_dev);
+
+				LOG_INF("QSPI flash deferred init: rc=%d ready=%d",
+					drc, (int)device_is_ready(qspi_dev));
+			}
+		}
+#endif
+
 		FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(qspi_lfs));
 		int rc = fs_mount(&FS_FSTAB_ENTRY(DT_NODELABEL(qspi_lfs)));
 		if (is_mounted(extMountPoint())) {
@@ -162,6 +215,19 @@ bool ZephyrDataStore::exists(const char *path) const
 
 bool ZephyrDataStore::removeFile(const char *path)
 {
+	/* Idempotent: an absent file is a successful removal.
+	 *
+	 * Guarded by fs_stat rather than unlinking blind because fs_unlink()
+	 * returns -ENOENT for a missing path and Zephyr's FS layer logs that at
+	 * ERR level regardless of us ignoring the return.  Every caller here is
+	 * best-effort cleanup of a file that usually is NOT there, so unguarded
+	 * this puts an <err> line on the happy path of every boot — exactly the
+	 * noise that makes a real filesystem error invisible. */
+	struct fs_dirent entry;
+
+	if (fs_stat(path, &entry) != 0) {
+		return true;
+	}
 	return fs_unlink(path) == 0;
 }
 
@@ -212,7 +278,14 @@ bool ZephyrDataStore::copyFile(const char *src, const char *dst)
 		return false;
 	}
 
-	fs_unlink(tmp_path);
+	/* Guarded for the same reason as atomicWriteTempFile(): a blind unlink of
+	 * a file that is normally absent logs -ENOENT at ERR level from the FS
+	 * layer, on the success path. */
+	struct fs_dirent tmp_ent;
+
+	if (fs_stat(tmp_path, &tmp_ent) == 0) {
+		fs_unlink(tmp_path);
+	}
 
 	struct fs_file_t src_file, dst_file;
 	fs_file_t_init(&src_file);
@@ -333,84 +406,14 @@ void ZephyrDataStore::checkAdvBlobFile()
 
 bool ZephyrDataStore::formatFileSystem()
 {
-	LOG_INF("formatFileSystem: starting...");
+	/* The erase/remount itself lives in ZephyrFsFormat.c so the repeater,
+	 * room server and observer — which build RepeaterDataStore and never
+	 * compile this file — get the identical implementation. */
+	bool ext_mounted = false;
+	bool mounted = zephcore_fs_format_all(&ext_mounted);
 
-	/* Properly unmount from Zephyr's VFS before erasing flash.
-	 * The old unmount() only cleared flags — Zephyr still held /lfs mounted,
-	 * so flash_area_flatten silently destroyed the on-flash superblock while
-	 * LittleFS considered itself active.  Every subsequent file op then hit
-	 * the erased blocks and logged "Corrupted dir pair at {0x0, 0x1}".
-	 * FS_FSTAB_DECLARE_ENTRY exposes the non-static mount struct generated
-	 * from the DTS fstab; fs_mount() on a blank partition auto-formats
-	 * (littlefs_fs.c: lfs_mount fail → lfs_format → lfs_mount). */
-	FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(lfs));
-	fs_unmount(&FS_FSTAB_ENTRY(DT_NODELABEL(lfs)));
-	lfs_mounted = false;
-
-#if DT_NODE_EXISTS(DT_NODELABEL(qspi_lfs))
-	FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(qspi_lfs));
-	fs_unmount(&FS_FSTAB_ENTRY(DT_NODELABEL(qspi_lfs)));
-#endif
-	ext_lfs_mounted = false;
-
-	const struct flash_area *fap;
-	int rc;
-
-#if FIXED_PARTITION_EXISTS(lfs_partition)
-	rc = flash_area_open(PARTITION_ID(lfs_partition), &fap);
-	if (rc == 0) {
-		LOG_INF("Formatting LFS partition (%u bytes)", (unsigned)fap->fa_size);
-		flash_area_flatten(fap, 0, fap->fa_size);
-		flash_area_close(fap);
-	}
-#endif
-
-#if FIXED_PARTITION_EXISTS(storage_partition)
-	rc = flash_area_open(PARTITION_ID(storage_partition), &fap);
-	if (rc == 0) {
-		LOG_INF("Formatting NVS storage (%u bytes)", (unsigned)fap->fa_size);
-		flash_area_flatten(fap, 0, fap->fa_size);
-		flash_area_close(fap);
-	}
-#endif
-
-#if FIXED_PARTITION_EXISTS(qspi_storage_partition)
-	/* QSPI if present (any platform) */
-	rc = flash_area_open(PARTITION_ID(qspi_storage_partition), &fap);
-	if (rc == 0) {
-		LOG_INF("Formatting QSPI (%u bytes, may take a while)", (unsigned)fap->fa_size);
-		flash_area_flatten(fap, 0, fap->fa_size);
-		flash_area_close(fap);
-	}
-#endif
-
-	/* Remount: littlefs_mount() auto-formats on blank flash, then mounts. */
-	rc = fs_mount(&FS_FSTAB_ENTRY(DT_NODELABEL(lfs)));
-	bool mounted = (rc == 0);
-	if (mounted) {
-		lfs_mounted = true;
-	}
-
-#if DT_NODE_EXISTS(DT_NODELABEL(qspi_lfs))
-	/* Remount external QSPI too.  We unmounted it above and flattened its
-	 * partition, so it must be re-mounted here — otherwise a runtime format
-	 * (factory reset, or the first-boot "no prefs" auto-format) leaves /ext
-	 * unmounted for the rest of the session.  begin() then reads
-	 * ext_lfs_mounted=false and the store falls back to internal /lfs, so
-	 * contacts/channels save to /lfs and get needlessly migrated back to /ext
-	 * on the next boot ("Migrating contacts to external storage" churn). */
-	{
-		FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(qspi_lfs));
-		int ext_rc = fs_mount(&FS_FSTAB_ENTRY(DT_NODELABEL(qspi_lfs)));
-		if (is_mounted(extMountPoint())) {
-			ext_lfs_mounted = true;
-			LOG_INF("formatFileSystem: /ext remounted (rc=%d)", ext_rc);
-		} else {
-			ext_lfs_mounted = false;
-			LOG_ERR("formatFileSystem: /ext remount failed (rc=%d)", ext_rc);
-		}
-	}
-#endif
+	lfs_mounted = mounted;
+	ext_lfs_mounted = ext_mounted;
 
 	LOG_INF("formatFileSystem: mount() returned %d", mounted ? 1 : 0);
 	return mounted;
@@ -513,16 +516,40 @@ bool ZephyrDataStore::loadMainIdentity(mesh::LocalIdentity &identity)
 {
 	uint8_t buf[PRV_KEY_SIZE + PUB_KEY_SIZE + 32];
 	size_t len = 0;
-	if (!openRead(MAIN_ID_FILE, buf, sizeof(buf), len) || len < PRV_KEY_SIZE + PUB_KEY_SIZE) {
+	if (!openRead(MAIN_ID_FILE, buf, sizeof(buf), len) || len < PRV_KEY_SIZE) {
 		return false;
 	}
-	return identity.readFrom(buf, len);
+	if (identity.readFromStorage(buf, len)) {
+		return true;
+	}
+	if (identity.recoverFromStorage(buf, len)) {
+		/* Deliberately not re-persisted: the file is the only record of what
+		 * went wrong, and re-deriving costs a few ms per boot.  The repeated
+		 * warning is the point — this state should be visible, not papered
+		 * over silently. */
+		LOG_WRN("main identity pub/prv mismatch - advertising the pub its private key owns");
+		return true;
+	}
+
+	/* No layout coheres — the stored pub is not prv·B under any reading, so
+	 * the pair is unusable: adverts would verify nowhere, inbound DMs would
+	 * not decrypt, and CMD_EXPORT_PRIVATE_KEY would hand the app a key that
+	 * contradicts SELF_INFO.  Returning false makes the caller generate a
+	 * fresh identity, so park the bytes first rather than overwriting them —
+	 * the private key may still be extractable by hand. */
+	LOG_ERR("main identity incoherent (%d bytes) - keeping bytes at %s, regenerating",
+		(int)len, MAIN_ID_BAD_FILE);
+	fs_unlink(MAIN_ID_BAD_FILE);
+	if (fs_rename(MAIN_ID_FILE, MAIN_ID_BAD_FILE) < 0) {
+		LOG_ERR("failed to park corrupt identity - regenerating over it");
+	}
+	return false;
 }
 
 bool ZephyrDataStore::saveMainIdentity(const mesh::LocalIdentity &identity)
 {
 	uint8_t buf[PRV_KEY_SIZE + PUB_KEY_SIZE + 32];
-	size_t n = identity.writeTo(buf, sizeof(buf));
+	size_t n = identity.writeToStorage(buf, sizeof(buf));
 	if (n == 0) {
 		return false;
 	}
@@ -541,6 +568,16 @@ uint8_t ZephyrDataStore::takeShutdownReason()
 {
 	uint8_t code = 0;
 	size_t len = 0;
+
+	/* No marker is the NORMAL case — it exists only after a software
+	 * power-off.  Probe before opening: fs_open() on a missing path is
+	 * logged at ERR level by Zephyr's FS layer, so an unguarded read here
+	 * put a second <err> line on every clean boot. */
+	struct fs_dirent marker;
+
+	if (fs_stat(SHUTDOWN_FILE, &marker) != 0) {
+		return 0;
+	}
 
 	if (openRead(SHUTDOWN_FILE, &code, sizeof(code), len) && len >= 1) {
 		removeFile(SHUTDOWN_FILE);
@@ -807,6 +844,71 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 			prefs.adc_multiplier = 0.0f;
 		}
 	}
+
+	/* Offset 163-165: extra_sf (ZephCore extension, LR2021 side detectors).
+	 * Absent in pre-existing files → stays zeroed = feature off.  Values
+	 * are re-validated by the driver when applied, so a corrupt byte here
+	 * costs a rejected config, not a bad radio state. */
+	for (int i = 0; i < EXTRA_SF_MAX && off < len; i++) {
+		prefs.extra_sf[i] = buf[off++];
+	}
+
+	/* Offset 166: v_contact_flags (ZephCore extension).  Absent in pre-existing
+	 * files → stays 0, which is exactly the old behaviour (no favourite, no
+	 * telemetry permissions). */
+	if (off < len) {
+		prefs.v_contact_flags = buf[off++];
+	}
+
+	/* Offset 167: fem_rxgain (ZephCore extension).  Absent in pre-existing
+	 * files → keeps the caller's initNodePrefs() default of 1, which is the
+	 * behaviour every deployed node already has (the FEM's chip-enable has
+	 * always been asserted for RX). */
+	if (off < len) {
+		prefs.fem_rxgain = buf[off++];
+	}
+
+	/* Offset 168-169: display_rotate / input_rotate (ZephCore extension).
+	 * Absent in pre-existing files → both stay at the initNodePrefs() default
+	 * of 0, i.e. the stock mounting orientation every deployed node runs. */
+	if (off < len) {
+		prefs.display_rotate = buf[off++];
+	}
+	if (off < len) {
+		prefs.input_rotate = buf[off++];
+	}
+
+	/* Offset 170: cad_base (ZephCore extension).  Absent in pre-existing
+	 * files → stays 0, which setCadParams() reads as "no base recorded" and
+	 * leaves the stored offset exactly where it is.  That is the right
+	 * migration: a node upgrading across the table change has no way to know
+	 * which base its offset was learned against, so re-anchoring it would be
+	 * guessing, and the staircase re-converges on its own either way. */
+	if (off < len) {
+		prefs.cad_base = buf[off++];
+	}
+
+	/* Offset 171: tz_offset (ZephCore extension, signed whole hours).
+	 * Absent in pre-existing files → stays 0 = UTC, which is exactly what
+	 * every already-deployed node displays today.  Range is re-checked by
+	 * sanitizeNodePrefs() below. */
+	if (off < len) {
+		prefs.tz_offset = (int8_t)buf[off++];
+	}
+
+	/* Offset 172-173: leds_radio_mode / leds_hb_mode (ZephCore extension).
+	 * Absent in pre-existing files → both stay at the initNodePrefs() defaults
+	 * of 0, and 0 is deliberately the behaviour every already-deployed node has
+	 * (activity LED on transmit, heartbeat with unread indication).  Range is
+	 * re-checked by sanitizeNodePrefs() below. */
+	if (off < len) {
+		prefs.leds_radio_mode = buf[off++];
+	}
+	if (off < len) {
+		prefs.leds_hb_mode = buf[off++];
+	}
+
+	sanitizeNodePrefs(&prefs);
 }
 
 void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
@@ -901,7 +1003,26 @@ void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
 	 * field existed — battery calibration silently reset every reboot. */
 	memcpy(&buf[off], &prefs.adc_multiplier, sizeof(float));
 	off += 4;
-	/* Total: 163 bytes */
+	/* Offset 163-165: extra_sf (ZephCore extension, LR2021 side detectors) */
+	memcpy(&buf[off], prefs.extra_sf, EXTRA_SF_MAX);
+	off += EXTRA_SF_MAX;
+	/* Offset 166: v_contact_flags (ZephCore extension) */
+	buf[off++] = prefs.v_contact_flags;
+	/* Offset 167: fem_rxgain (ZephCore extension, external FEM LNA in RX) */
+	buf[off++] = prefs.fem_rxgain;
+	/* Offset 168-169: display_rotate / input_rotate (ZephCore extension) */
+	buf[off++] = prefs.display_rotate;
+	buf[off++] = prefs.input_rotate;
+	/* Offset 170: cad_base (ZephCore extension, family base detPeak the
+	 * cad_offset above was learned against) */
+	buf[off++] = prefs.cad_base;
+	/* Offset 171: tz_offset (ZephCore extension, signed whole hours from UTC,
+	 * display only — the stored clock is always UTC) */
+	buf[off++] = (uint8_t)prefs.tz_offset;
+	/* Offset 172-173: leds_radio_mode / leds_hb_mode (ZephCore extension). */
+	buf[off++] = prefs.leds_radio_mode;
+	buf[off++] = prefs.leds_hb_mode;
+	/* Total: 174 bytes */
 
 	bool ok = atomicReplaceFile(PREFS_FILE, buf, off);
 	LOG_DBG("savePrefs: wrote %s, ok=%d (%d bytes), name='%.16s'",
@@ -957,6 +1078,15 @@ void ZephyrDataStore::loadContacts(DataStoreHost *host)
 {
 	const char *path = contactsFile();
 
+	/* Probe first: this file does not exist until a contact is stored, and
+	 * fs_open() on a missing path is logged at ERR by Zephyr's FS layer no
+	 * matter how gracefully we handle the return.  The open below is kept as
+	 * the real error path (a file that exists but cannot be opened). */
+	if (!exists(path)) {
+		LOG_DBG("loadContacts: no contacts file found");
+		return;
+	}
+
 	struct fs_file_t file;
 	fs_file_t_init(&file);
 	int rc = fs_open(&file, path, FS_O_READ);
@@ -990,12 +1120,27 @@ void ZephyrDataStore::loadContacts(DataStoreHost *host)
 void ZephyrDataStore::saveContacts(DataStoreHost *host)
 {
 	const char *path = contactsFile();
+
+	/* Atomic replace ONLY where there is external flash — deliberately, and
+	 * not to be "fixed" later.
+	 *
+	 * atomicWriteTempFile() needs room for a second full copy before the
+	 * rename.  contacts3 is by far the largest store here (152 B per record,
+	 * ~47 KB at 313 contacts) and internal /lfs on these boards is 128 KB
+	 * total, shared with identity, prefs and channels2.  Two copies would sit
+	 * at ~94 KB of 128 KB before LittleFS metadata, so the atomic path could
+	 * fail with ENOSPC exactly when it is most needed — a worse failure than
+	 * the one it prevents.
+	 *
+	 * channels2, identity and prefs are atomic everywhere because they are
+	 * small enough for the second copy to be free.  Only contacts is gated.
+	 *
+	 * The non-atomic branch below is therefore the constrained-board path,
+	 * and it writes in place and truncates rather than unlinking first — see
+	 * the note there. */
 	bool use_atomic = _has_ext_fs;
 	const char *save_mode = use_atomic ? "atomic" : "direct";
 
-	if (!use_atomic && exists(path)) {
-		fs_unlink(path);
-	}
 
 	struct fs_file_t file;
 	uint8_t rec[CONTACT_DATA_SZ];
@@ -1032,6 +1177,21 @@ void ZephyrDataStore::saveContacts(DataStoreHost *host)
 		};
 		write_ok = atomicWriteTempFile(path, atomic_contacts_writer, &ctx, "saveContacts");
 	} else {
+		/* Overwrite in place, then truncate — never unlink first.
+		 *
+		 * This branch runs on boards with no external flash, i.e. the ones
+		 * that cannot afford the atomic temp-file dance.  It used to
+		 * fs_unlink() the contacts file before recreating it, which left a
+		 * window spanning the whole ~47 KB write where contacts3 did not
+		 * exist at all: a power cut there lost every contact rather than
+		 * corrupting some.  The unlink was only ever a way to truncate.
+		 *
+		 * Truncating afterwards is the same guarantee without the window —
+		 * the file is always present, and at worst briefly longer than its
+		 * new contents (stale records past the end, which the truncate then
+		 * removes).  FS_O_TRUNC is NOT usable here: Zephyr's LittleFS
+		 * backend maps only CREATE/READ/WRITE/APPEND and drops TRUNC
+		 * silently, so asking for it would leave the stale tail in place. */
 		fs_file_t_init(&file);
 		int rc = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 		if (rc < 0) {
@@ -1039,6 +1199,20 @@ void ZephyrDataStore::saveContacts(DataStoreHost *host)
 			return;
 		}
 		write_ok = write_contacts(&file);
+
+		int trunc_rc = 0;
+
+		if (write_ok) {
+			trunc_rc = fs_truncate(&file,
+					       (off_t)written * CONTACT_DATA_SZ);
+			if (trunc_rc < 0) {
+				LOG_ERR("saveContacts: truncate to %u failed: %d",
+					(unsigned)(written * CONTACT_DATA_SZ),
+					trunc_rc);
+				write_ok = false;
+			}
+		}
+
 		int sync_rc = fs_sync(&file);
 		fs_close(&file);
 		if (!write_ok || sync_rc < 0) {
@@ -1061,6 +1235,14 @@ void ZephyrDataStore::saveContacts(DataStoreHost *host)
 void ZephyrDataStore::loadChannels(DataStoreHost *host)
 {
 	const char *path = channelsFile();
+
+	/* Probe first — same reason as loadContacts(): absent until a channel is
+	 * configured, and a missing-path fs_open() is logged at ERR by the FS
+	 * layer regardless of us handling it. */
+	if (!exists(path)) {
+		return;
+	}
+
 	struct fs_file_t file;
 	fs_file_t_init(&file);
 	if (fs_open(&file, path, FS_O_READ) < 0) {

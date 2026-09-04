@@ -57,7 +57,7 @@
 #ifdef CONFIG_ZEPHCORE_ACK_TABLE_SIZE
 #define ACK_TABLE_SIZE CONFIG_ZEPHCORE_ACK_TABLE_SIZE
 #else
-#define ACK_TABLE_SIZE 8
+#define ACK_TABLE_SIZE 16
 #endif
 
 /* Recently-heard advert path slots */
@@ -91,11 +91,12 @@ typedef void (*RadioReconfigureCallback)(void);
 /* BLE PIN change callback */
 typedef void (*PinChangeCallback)(uint32_t new_pin);
 
-/* V-contact CLI execution callback — runs a text-CLI line and fills `reply`
- * (buffer is VCONTACT_CLI_REPLY_SIZE). Registered by main_companion so the
- * v-contact chat reuses the same CommonCLI instance as the USB text CLI. */
-#define VCONTACT_CLI_REPLY_SIZE 256
-typedef void (*VContactCLICallback)(const char *line, char *reply);
+/* Companion CLI execution callback — runs a text-CLI line and fills `reply`
+ * (buffer is COMPANION_CLI_REPLY_SIZE). Registered by main_companion so every
+ * companion-side CLI entry point shares one CommonCLI instance: the USB text
+ * CLI, the v-contact chat, and CMD_RUN_CLI_COMMAND from the app. */
+#define COMPANION_CLI_REPLY_SIZE 256
+typedef void (*CompanionCLICallback)(const char *line, char *reply);
 
 /**
  * CompanionMesh: Application layer for ZephCore Companion device
@@ -164,10 +165,13 @@ public:
 	 * A synthesized CHAT contact visible only to the connected BLE/USB app.
 	 * Messages to it are short-circuited into the CLI before any packet is
 	 * created — nothing ever reaches the dispatcher or the radio. Its pubkey
-	 * is SHA256("zc-vcontact" || self pubkey); no private key exists and it
-	 * is never registered in the RF RX matching path, so over-the-air
-	 * traffic addressed to it is inert. */
-	void setVContactCLICallback(VContactCLICallback cb) { _vcontact_cli_cb = cb; }
+	 * is the Ed25519 point of a keypair seeded from
+	 * SHA256("zc-vcontact" || self prv_key || counter) — a real point, because
+	 * strict clients decompress peer keys and reject anything else. The private
+	 * half is derived and dropped: never stored, never used. The key is never
+	 * registered in the RF RX matching path, so over-the-air traffic addressed
+	 * to it is inert. */
+	void setCLICallback(CompanionCLICallback cb) { _cli_exec_cb = cb; }
 	bool isVContactEnabled() const { return prefs.v_contact_enabled != 0; }
 	/** Queue an unsolicited v-contact message (battery alert, restart reason).
 	 *  Goes through the offline queue — delivered on next app connect/sync. */
@@ -182,6 +186,10 @@ public:
 	 *  carry sane timestamps. Self-gating; safe to call speculatively. Hooked
 	 *  at CMD_APP_START, CMD_SET_DEVICE_TIME, and GPS time sync. */
 	void vcontactClockSynced();
+	/** True while a v-contact delivery-ack is still waiting to be emitted.
+	 *  Reboot-class CLI commands gate on this (plus transport TX idle) so the
+	 *  ack is not cut off by the reset it just scheduled. */
+	bool vcontactConfirmPending() const { return _vcontact_confirm_ack != 0; }
 
 	/**
 	 * Continue contact iteration (call each main loop iteration).
@@ -387,7 +395,6 @@ private:
 		bool active;
 	};
 	AckEntry _ack_table[ACK_TABLE_SIZE];
-	int _ack_next_overwrite;
 
 	/* Advert path table for tracking recently heard nodes */
 	AdvertPath _advert_paths[ADVERT_PATH_TABLE_SIZE];
@@ -414,9 +421,25 @@ private:
 	int64_t _dirty_channels_expiry;
 	static constexpr int64_t LAZY_WRITE_DELAY_MS = 5000;  /* 5 seconds, matches Arduino */
 
+	/* Deadline for liveness-only contact updates — a re-heard advert from a
+	 * contact we already know, where the only fields that moved are
+	 * last_advert_timestamp and lastmod.
+	 *
+	 * saveContacts() rewrites the WHOLE file (fixed 152-byte records, no
+	 * incremental path), which on a board without external flash is ~47 KB
+	 * into a 128 KB LittleFS partition.  Measured on a T1000-E 2026-08-24:
+	 * 21 full rewrites in 90 minutes, one per advert arrival, because every
+	 * re-advert marked the file dirty on the same 5 s deadline as a real
+	 * change.  That is a flash-wear problem on a battery tracker.
+	 *
+	 * Liveness still persists — it just waits, so an hour of re-adverts
+	 * costs one write instead of fourteen.  A substantive change (new
+	 * contact, message, path update) still pulls the deadline back in. */
+	static constexpr int64_t LAZY_WRITE_LIVENESS_MS = 600000;  /* 10 minutes */
+
 	void onLoginSent(const ContactInfo &contact) override;
 	void onChannelAdded(ChannelDetails *ch) override;
-	void markContactsDirty();
+	void markContactsDirty(bool substantive = true);
 	void markChannelsDirty();
 	void flushDirtyContacts();
 	void flushDirtyChannels();
@@ -488,7 +511,7 @@ private:
 	 * the clock was invalid (pre-1970s epoch) when we would have stamped it,
 	 * so the contact is withheld from sync/adverts until a time source
 	 * arrives — otherwise the app shows a 1970 last-heard timestamp. */
-	VContactCLICallback _vcontact_cli_cb;
+	CompanionCLICallback _cli_exec_cb;
 	uint8_t _vcontact_pubkey[PUB_KEY_SIZE];
 	uint32_t _vcontact_lastmod;
 	/* Dedupe app resends: a retry reuses the message timestamp (only the
@@ -507,8 +530,49 @@ private:
 	 * guard and truncates the sync. Held from CMD_APP_START until the first
 	 * PACKET_NO_MORE_MSGS (end of the contacts+messages initial sync). */
 	bool _vcontact_hold_msgwait;
+	/* App-side delete (CMD_REMOVE_CONTACT for the loopback key) hides the
+	 * v-contact for the rest of the session only — it deliberately does NOT
+	 * touch prefs.v_contact_enabled. The v-contact is an ordinary entry in the
+	 * app's contact list, so a "purge all contacts" walks it like any other and
+	 * used to permanently disable a firmware feature with no way back except
+	 * the USB CLI. The pref is node-side state: `set v.contact off` is the only
+	 * durable disable. Cleared at CMD_APP_START (the session reset). */
+	bool _vcontact_app_hidden;
+	/* Deferred delivery-ack for a v-contact chat message.
+	 *
+	 * The ack itself is computed and PACKET_SENT emitted synchronously (the app
+	 * is waiting on that as the response to its own write), but the
+	 * PUSH_CODE_SEND_CONFIRMED that marks the bubble delivered is held back.
+	 * Emitted inline it lands sub-millisecond after the response to the very
+	 * same write -- before the app has committed the outgoing message to its
+	 * own state -- and the app drops it.  It then resends at est_timeout, the
+	 * dedup ring above suppresses the CLI re-run, and the resend's ack is the
+	 * one that finally sticks: one reply, two acks, delivery mark seconds late.
+	 *
+	 * No radio ack can arrive that fast, so the real send path never provokes
+	 * this; the v-contact is the only sub-millisecond acker in the system.
+	 *
+	 * 0 = nothing pending.  Emitted by the timer only — see the note on
+	 * VCONTACT_CONFIRM_DELAY_MS for why an inbound frame is not the trigger. */
+	uint32_t _vcontact_confirm_ack;
+	/* CONTAINER_OF is offsetof underneath, and offsetof on a non-standard-layout
+	 * type is only conditionally supported — CompanionMesh has base classes and
+	 * virtuals, so it does not qualify (CommonCLI does, which is why the same
+	 * trick is clean there). Wrap the work item in a POD that carries its own
+	 * back-pointer: offsetof stays inside a standard-layout struct, and the
+	 * owner comes from the pointer rather than from pointer arithmetic. */
+	struct ConfirmWork {
+		struct k_work_delayable work;
+		CompanionMesh *self;
+	};
+	ConfirmWork _vcontact_confirm_work;
+	static void vcontactConfirmWorkHandler(struct k_work *work);
+	/** Emit a deferred SEND_CONFIRMED now, if one is pending.  Idempotent. */
+	void vcontactFlushConfirm();
 	bool vcontactClockValid();
-	bool vcontactReady() { return isVContactEnabled() && _vcontact_lastmod != 0; }
+	bool vcontactReady() {
+		return isVContactEnabled() && !_vcontact_app_hidden && _vcontact_lastmod != 0;
+	}
 	void buildVContact(ContactInfo &c) const;
 	bool isVContactKey(const uint8_t *key, int prefix_len) const;
 	/** (Re)derive _vcontact_pubkey from the current identity. Call on boot and

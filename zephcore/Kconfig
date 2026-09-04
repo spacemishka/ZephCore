@@ -51,6 +51,16 @@ source "$(ZEPHYR_BASE)/subsys/logging/Kconfig.template.log_config"
 
 menu "ZephCore"
 
+config ZEPHCORE_QSPI_RDID_PROBE
+	bool "QSPI flash bring-up probe"
+	help
+	  Five seconds after boot, report whether the QSPI flash driver came
+	  up. If it did not, print the init errno the driver discards and
+	  re-read the JEDEC id by bit-banging the pins as single-lane SPI,
+	  which distinguishes a driver-side fault from a part that is not
+	  answering. Skipped entirely when the flash is working, so it is safe
+	  to leave enabled. Bring-up diagnostic.
+
 config ZEPHCORE_RESET_ON_FATAL_ERROR
 	bool "Reboot on fatal error"
 	default y
@@ -124,7 +134,11 @@ config ZEPHCORE_COMPANION_USB
 	  depends forces this to n automatically — no conf change needed.
 
 	  For ESP32-S3 boards, USB_DEVICE_STACK_NEXT must be enabled first via
-	  boards/common/esp32s3_usb.conf before this becomes active.
+	  boards/common/esp32s3_usb.conf before this becomes active.  CMakeLists.txt
+	  adds that conf automatically to companion builds on the S3 boards whose
+	  board.overlay declares the USB OTG CDC-ACM node, so it is on by default
+	  there too — but not on repeater/observer/room-server or debug builds,
+	  which keep the port for the console.
 
 config ZEPHCORE_COMPANION_SERIAL
 	bool "Enable plain-UART companion transport"
@@ -189,7 +203,21 @@ config ZEPHCORE_GUEST_PASSWORD
 	string "Default guest password"
 	default ""
 	help
-	  Default password for guest access. Empty string disables guest access.
+	  Default password for guest access.
+
+	  An empty string means different things per role, matching Arduino
+	  MeshCore:
+
+	    REPEATER     - open guest access.  A blank submitted password logs
+	                   in as PERM_ACL_GUEST, which cannot run CLI commands
+	                   or read the access list; it gets login plus
+	                   status/telemetry.
+	    ROOM SERVER  - guest access disabled, so a room is never
+	                   accidentally left open.  Arduino reaches the same
+	                   place by defaulting the room server's guest password
+	                   to ROOM_PASSWORD instead of leaving it empty.
+
+	  Set a non-empty value to require a password on either role.
 
 config ZEPHCORE_MAX_UNSYNCED_POSTS
 	int "Room server: max buffered posts"
@@ -251,9 +279,15 @@ config ZEPHCORE_OFFLINE_QUEUE_SIZE
 
 config ZEPHCORE_ACK_TABLE_SIZE
 	int "ACK tracking table size"
-	default 8
+	default 16
 	help
 	  Number of pending ACKs that can be tracked.
+
+	  Sizing this below the number of messages that can be in flight at
+	  once costs delivery confirmations: a peer working through a backlog
+	  can answer seconds later, and an entry evicted before its ACK
+	  arrives leaves the message unconfirmed, prompting a retry that adds
+	  further load. Each entry costs 16 bytes.
 
 config ZEPHCORE_MAX_CONNECTIONS
 	int "Maximum server connections"
@@ -425,9 +459,10 @@ config ZEPHCORE_NOISE_FLOOR_INTERVAL_MS
 	  raising it there would change their RF tracking for no power gain, since
 	  their housekeeping timer wakes them at 5 s regardless.
 
-	  Repeaters use 15 s, matching ZEPHCORE_CAD_PROBE_INTERVAL — the only other
-	  recurring radio deadline — so the two do not interleave into separate
-	  wakes any more often than they have to.
+	  Repeaters use 15 s, matching the default probe.interval pref (set in
+	  initNodePrefs(), helpers/NodePrefs.h) — the only other recurring radio
+	  deadline — so the two do not interleave into separate wakes any more
+	  often than they have to.
 
 	  On a repeater this is one of the two shortest recurring deadlines, so it
 	  bounds how long the SoC can sleep between wakes.  Raising it stretches
@@ -468,10 +503,16 @@ config ZEPHCORE_PM_CONSOLE_UART_NUM
 	  esp_rom_uart_tx_wait_idle() before entering light sleep, so a line in
 	  the TX FIFO is not cut off mid-character by the clock stopping.
 
-	  0 is correct for every board this is currently enabled on: their
-	  console is uart0, whether via a USB-serial bridge (Heltec V3/V4/V4.3)
-	  or the ROM-default pads.  Change it only if a board's console is moved
-	  to another hardware UART — a wrong index does not fail the build, it
+	  0 is correct for the boards whose console really is uart0: Heltec V3
+	  (via a CP2102 bridge) and anything on the ROM-default pads.  On Heltec
+	  V4, V4.3 and Wireless Tracker V2 the console is usb_serial (their
+	  board.overlay chooses it, and the uart0 reroute in
+	  boards/common/esp32s3_usb.overlay is companion-only), so this flush
+	  targets a peripheral that is not their console and does nothing.  That
+	  is harmless but not a fix: a USJ console has no wake source either way,
+	  so on those boards the USB CLI is simply unavailable once
+	  ZEPHCORE_PM_BOOT_AWAKE_MS expires.  Change it only if a board's console
+	  is moved to another hardware UART — a wrong index does not fail the build, it
 	  just silently flushes the wrong peripheral and lets the console
 	  truncate again.
 
@@ -685,7 +726,7 @@ config ZEPHCORE_LORA_DC_MIN_SYMBOLS
 config ZEPHCORE_LORA_DC_MARGIN_PCT
 	int "RX duty cycle: sleep-budget safety margin (percent)"
 	range 0 40
-	default 15
+	default 5
 	help
 	  Percentage the per-cycle deaf-time budget is derated before the
 	  sleep period is programmed.  The theoretical catch budget assumes
@@ -699,8 +740,53 @@ config ZEPHCORE_LORA_DC_MARGIN_PCT
 	  independent loss that presents as random DC packet drops.  This
 	  margin trades a little radio-off time for that robustness and is
 	  shared by every radio (SX126x / LR11xx / LR20xx).  Set to 0 to
-	  restore the old zero-margin behaviour; 15% is a conservative default,
-	  lower it once you have measured your board's clock+transition on air.
+	  restore the old zero-margin behaviour.
+
+	  Lowered from 15% to 5% on 2026-08-21.  What justifies it: the clock
+	  half of the error is bounded, not open-ended.  RC64k is recalibrated
+	  by Calibrate(ALL) (SX126X_CALIBRATE_RC64K is bit 0 of 0x7F) whenever
+	  agcMaintenance() sees the chip temperature move AGC_RECAL_TEMP_DELTA_C
+	  (5 C), so the drift this must absorb is what accrues inside a 5 C
+	  window, not across the whole operating range since boot.
+
+	  What it costs, at SF7/BW62.5/P=32 on a 5 ms-TCXO board: absolute slack
+	  against the catch budget falls from 4608 us (15%) to 1536 us (5%), and
+	  the tolerated sleep-timer error falls from 23.5% to 6.8%.  Off-time
+	  goes 30.9% -> 34.9%.  Note the tolerance always exceeds the margin
+	  percentage, because the derate applies to the whole budget while the
+	  clock error acts only on the sleep portion.
+
+	  The part NOT bounded by the temperature recalibration is the
+	  wake-transition estimate in hwWakeupTimeUs() -- a programmed TCXO delay
+	  (deterministic) plus ~1 ms of context restore and PLL lock that the
+	  datasheet itself calls "not accurate and may vary".  At 5% that term
+	  has 1536 us of headroom minus whatever RC64k drift consumes.  If a
+	  board shows unexplained duty-cycle packet loss, raise this first --
+	  the loss is signal-strength-independent, so RSSI will look fine and
+	  only a PDR comparison against rxduty 0 will show it.
+
+config ZEPHCORE_LORA_RETENTION_DEBUG
+	bool "SX126x: verify the warm-start retention list on air"
+	depends on ZEPHCORE_RADIO_NATIVE
+	help
+	  Read back the SX126x register retention list (0x029F) and the Rx gain
+	  register (0x08AC) and report whether they survived, at chip init and
+	  after every duty-cycle packet.
+
+	  This exists to answer one question: does installing the retention list
+	  once at init actually hold?  The list is what restores Rx gain across
+	  the chip-internal sleep->RX wakes of SetRxDutyCycle, which the host
+	  never sees.  If it does not hold, every window after the first sleep
+	  listens at power-saving gain -- a silent 3 dB sensitivity loss with
+	  nothing in the log, which is precisely the failure this check makes
+	  visible.
+
+	  The check runs after RX_DONE and before sx126x_restart_rx() rewrites
+	  the gain, so it observes the value the packet was actually received
+	  with rather than the one we are about to reapply.
+
+	  Costs two SPI register reads per received packet.  Debug builds only;
+	  enabled by boards/common/debug.conf.
 
 endmenu
 
@@ -763,6 +849,70 @@ config ZEPHCORE_REPEATER_GPS_INTERVAL_SEC
 	  0 = always-on (never sleeps). Applied at boot until the operator
 	  overrides it with "set gps duty <sec>" (persisted to flash).
 	  Companions default to ZEPHCORE_GPS_POLL_INTERVAL_SEC (300s) instead.
+
+config ZEPHCORE_GPS_NMEA_DUMP
+	bool "Log every NMEA sentence received from the GNSS module"
+	depends on GNSS
+	help
+	  Print each sentence the GNSS driver parses, plus everything else the
+	  module emits, to the console. For diagnosing a receiver that reports
+	  no satellites: it distinguishes a module that is talking normally
+	  while it searches the sky from one that is silent, at the wrong baud,
+	  or has had its NMEA output disabled — cases that are otherwise
+	  indistinguishable from the application.
+
+	  Verbose: at 1 Hz with multi-GNSS this is a continuous stream, and on
+	  a repeater it shares the console with the CLI. Diagnostic builds only.
+
+config ZEPHCORE_GPS_NAV_MODE
+	int "GNSS navigation dynamic model (CASIC $PCAS11)"
+	range -1 7
+	default 1 if ZEPHCORE_ROLE_REPEATER || ZEPHCORE_ROLE_ROOM_SERVER
+	default 3
+	help
+	  Dynamic model sent to CASIC-family GNSS modules (Quectel L76K/L76KB,
+	  Air530Z) on boards using the generic-NMEA driver: 0 = portable,
+	  1 = stationary, 2 = pedestrian, 3 = automotive, 4 = sea,
+	  5-7 = airborne. -1 sends nothing.
+
+	  Defaults to stationary for fixed roles and automotive otherwise.
+	  Worth setting rather than leaving alone: the model is stored IN THE
+	  MODULE and survives reflashing the host, so a slot module that
+	  previously lived in another device can arrive stuck in an airborne
+	  model that quietly degrades fixes on a fixed site.
+
+	  Boards that always carry a CASIC part use the air530z driver instead
+	  — see CONFIG_GNSS_LUATOS_AIR530Z_NAV_MODE for those.
+
+config ZEPHCORE_GPS_SAT_DIAG
+	bool "GPS per-constellation satellite diagnostics"
+	# Must depend on GNSS, not just select GNSS_SATELLITES: on a board with
+	# no GNSS at all (native Linux, xiao_nrf52840) GNSS is n, and y-selecting
+	# a symbol whose dependencies are unmet is a Kconfig error that aborts the
+	# build — not a warning. The repeater default below would otherwise turn
+	# this on for every GNSS-less repeater target.
+	depends on GNSS
+	select GNSS_SATELLITES
+	default y if ZEPHCORE_ROLE_REPEATER
+	help
+	  Tally tracked satellites per constellation from GSV sentences and
+	  report them in "get gps" as sys=G<n>/R<n>/E<n>/B<n>/?<n>
+	  (GPS / GLONASS / Galileo / BeiDou / other).
+
+	  This is the ground truth for whether the boot-time multi-constellation
+	  configuration (PMTK353 / UBX-CFG-GNSS) actually took: a module still in
+	  its GPS-only default emits only $GPGSV, so every counter but G stays 0.
+	  Satellite count alone cannot prove this — only the talker IDs can.
+
+	  Costs RAM: CONFIG_GNSS_SATELLITES adds 512 bytes to the driver's UART
+	  RX buffer plus a per-satellite array (~770 bytes total, measured on
+	  RAK3401). Default on for repeaters, which have the headroom; off for
+	  companions, which are RAM-bound. Enable it explicitly for a companion
+	  diagnostic build.
+
+	  Independent of "set gps diag", which is a runtime toggle and always
+	  available — this option only adds the per-constellation evidence to
+	  its report.
 
 endmenu
 

@@ -4,8 +4,9 @@
  */
 
 #include "RepeaterDataStore.h"
+#include "../adapters/datastore/ZephyrFsFormat.h"
 #include <zephyr/fs/fs.h>
-#include <zephyr/storage/flash_map.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,6 +37,37 @@ bool RepeaterDataStore::begin() {
 }
 
 const char* RepeaterDataStore::getBasePath() const { return BASE_PATH; }
+
+static bool fileExists(const char* path) {
+    struct fs_dirent entry;
+    return fs_stat(path, &entry) == 0;
+}
+
+bool RepeaterDataStore::hasRoleData() const {
+    char path[64];
+
+    /* Only THIS role's files count.  A companion volume does not: the roles
+     * are deliberately not interchangeable, and a companion's contacts and
+     * blob cache would eat into the same 128 KB the repeater needs, so a
+     * repeater booting onto a companion volume formats it.  The reverse
+     * already happens — ZephyrDataStore::hasPrefs() tests /lfs/new_prefs,
+     * which a repeater volume never has.
+     *
+     * Repeater, room server and observer DO share this store and base path;
+     * they use the same prefs layout, so switching among them keeps the
+     * node's identity, which is what an operator wants.
+     *
+     * Self-limiting: loadPrefs() persists defaults on boot 1 and main_*.cpp
+     * saves a generated identity on the same boot, so after one successful
+     * boot at least one of these exists and the check never fires again. */
+    static const char* const ours[] = { "prefs", "_main.id" };
+    for (size_t i = 0; i < ARRAY_SIZE(ours); i++) {
+        snprintf(path, sizeof(path), "%s/%s", BASE_PATH, ours[i]);
+        if (fileExists(path)) return true;
+    }
+
+    return false;
+}
 
 const char* RepeaterDataStore::getAclPath() const {
     static char buf[48];
@@ -69,13 +101,28 @@ bool RepeaterDataStore::loadIdentity(mesh::LocalIdentity& id) {
     LOG_DBG("loadIdentity: read %d bytes from %s", (int)n, path);
 
     if (n >= PRV_KEY_SIZE) {
-        if (id.readFrom(buf, n)) {
+        if (id.readFromStorage(buf, n)) {
             LOG_INF("Loaded identity from %s", path);
             return true;
         }
-        LOG_ERR("loadIdentity: readFrom failed");
+        if (id.recoverFromStorage(buf, n)) {
+            /* Not re-persisted on purpose — see ZephyrDataStore::loadMainIdentity. */
+            LOG_WRN("identity pub/prv mismatch - advertising the pub its private key owns");
+            return true;
+        }
+        LOG_ERR("loadIdentity: no coherent key layout in %d bytes", (int)n);
     }
 
+    /* Unusable pair — the caller regenerates, so park the bytes instead of
+     * letting a fresh identity overwrite them (same as the companion). */
+    char bad_path[56];
+    if (snprintf(bad_path, sizeof(bad_path), "%s.bad", path) < (int)sizeof(bad_path)) {
+        fs_unlink(bad_path);
+        if (fs_rename(path, bad_path) == 0) {
+            LOG_ERR("Identity file corrupt - kept at %s", bad_path);
+            return false;
+        }
+    }
     LOG_ERR("Identity file corrupt");
     return false;
 }
@@ -90,7 +137,15 @@ bool RepeaterDataStore::saveIdentity(const mesh::LocalIdentity& id) {
         return false;
     }
 
-    fs_unlink(tmp_path);
+    /* Guarded by fileExists() rather than unlinking blind: on the normal path
+     * the temp is absent, fs_unlink() returns -ENOENT, and Zephyr's FS layer
+     * logs that at ERR level regardless of us ignoring the return -- putting an
+     * <err> line on the happy path of every save, which is exactly the noise
+     * that makes a real filesystem error invisible.  Same guard as
+     * ZephyrDataStore::atomicWrite(). */
+    if (fileExists(tmp_path)) {
+        fs_unlink(tmp_path);
+    }
 
     struct fs_file_t file;
     fs_file_t_init(&file);
@@ -101,8 +156,10 @@ bool RepeaterDataStore::saveIdentity(const mesh::LocalIdentity& id) {
         return false;
     }
 
-    uint8_t buf[PRV_KEY_SIZE];
-    int len = id.writeTo(buf, sizeof(buf));
+    /* pub || prv, same as the companion and Arduino MeshCore.  Older builds
+     * wrote prv alone (64 bytes); readFromStorage() still accepts those. */
+    uint8_t buf[PUB_KEY_SIZE + PRV_KEY_SIZE];
+    int len = id.writeToStorage(buf, sizeof(buf));
     ssize_t n = fs_write(&file, buf, len);
     ret = fs_sync(&file);
     fs_close(&file);
@@ -216,6 +273,34 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
     fs_read(&file, &prefs.probe_interval, sizeof(prefs.probe_interval));
     /* cad_busycap absent in <301-byte files; EOF read keeps default 25 */
     fs_read(&file, &prefs.cad_busycap, sizeof(prefs.cad_busycap));
+    /* LR2021 side-detector SFs, offsets 301-303.  Absent in <304-byte files;
+     * the no-op EOF read leaves the zeroed default = feature off. */
+    fs_read(&file, prefs.extra_sf, sizeof(prefs.extra_sf));
+    /* External FEM RX gain, offset 304.  Absent in <305-byte files; the no-op
+     * EOF read keeps the initNodePrefs() default fem_rxgain=1, which is what
+     * every already-deployed node has been running. */
+    fs_read(&file, &prefs.fem_rxgain, sizeof(prefs.fem_rxgain));
+    /* Mounting orientation, offsets 305-306.  Absent in <307-byte files; the
+     * no-op EOF reads keep the initNodePrefs() defaults of 0/0, which is the
+     * stock orientation every already-deployed node runs. */
+    fs_read(&file, &prefs.display_rotate, sizeof(prefs.display_rotate));
+    fs_read(&file, &prefs.input_rotate, sizeof(prefs.input_rotate));
+    /* Family base detPeak cad_offset was learned against, offset 307.  Absent
+     * in <308-byte files; the no-op EOF read leaves 0, which setCadParams()
+     * reads as "no base recorded" and acts on by leaving the stored offset
+     * alone — correct, since a node upgrading across a table change cannot
+     * know which base its offset came from. */
+    fs_read(&file, &prefs.cad_base, sizeof(prefs.cad_base));
+    /* Display timezone offset, offset 308.  Absent in <309-byte files; the
+     * no-op EOF read leaves 0 = UTC, which is what every already-deployed
+     * node shows today.  Range is re-checked by sanitizeNodePrefs(). */
+    fs_read(&file, &prefs.tz_offset, sizeof(prefs.tz_offset));
+    /* LED activity/heartbeat modes, offsets 309-310.  Absent in <311-byte
+     * files; the no-op EOF read leaves the initNodePrefs() defaults of 0/0,
+     * which are deliberately the behaviour every already-deployed node has
+     * (activity LED on transmit, heartbeat with unread indication). */
+    fs_read(&file, &prefs.leds_radio_mode, sizeof(prefs.leds_radio_mode));
+    fs_read(&file, &prefs.leds_hb_mode, sizeof(prefs.leds_hb_mode));
 
     fs_close(&file);
 
@@ -223,10 +308,12 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
      * unwritten byte both mean "on". */
     prefs.leds_disabled = (leds_byte == LEDS_PREF_OFF) ? 1 : 0;
 
-    /* Migrate uninitialized backoff_multiplier (0.0 or NaN) to default */
-    if (prefs.backoff_multiplier == 0.0f || prefs.backoff_multiplier != prefs.backoff_multiplier) {
-        prefs.backoff_multiplier = 0.2f;
-    }
+    /* The 0.0-or-NaN -> 0.2 coercion that used to live here is gone.  It could
+     * not tell "field absent from an old file" from "the user set 0.0 to turn
+     * reactive backoff off", so the documented off switch never survived a
+     * reboot.  Both cases are now handled properly: initNodePrefs() supplies
+     * 0.2 and a short-file fs_read() is a no-op that keeps it, while NaN and
+     * out-of-range values are caught by sanitizeNodePrefs(). */
 
     LOG_INF("Loaded prefs from %s", path);
     LOG_DBG("  name='%s' freq=%.3f sf=%u bw=%.1f tx_pwr=%d",
@@ -240,19 +327,13 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
                 (double)prefs.freq, prefs.sf, (double)prefs.bw);
         prefs.freq = 869.618f;
         prefs.bw = 62.5f;
-        prefs.sf = 8;
-        prefs.cr = 8;
+        prefs.sf = 7;
+        prefs.cr = 5;
         prefs.tx_power_dbm = 22;
     }
-    if (prefs.path_hash_mode > 2) prefs.path_hash_mode = 0;
-    if (prefs.loop_detect > LOOP_DETECT_STRICT) prefs.loop_detect = LOOP_DETECT_MINIMAL;
-    if (prefs.rx_boost > 1) prefs.rx_boost = 0;
-    if (prefs.rx_duty_cycle > 1) prefs.rx_duty_cycle = 0;
-    if (prefs.meshtimesync > 1) prefs.meshtimesync = 0;
-    if (prefs.cad_auto > 1) prefs.cad_auto = 0;
-    if (prefs.cad_offset < CAD_OFFSET_MIN || prefs.cad_offset > CAD_OFFSET_MAX) prefs.cad_offset = 0;
-    if (prefs.probe_interval != 0 && prefs.probe_interval < 10) prefs.probe_interval = 10;
-    if (prefs.cad_busycap > 90) prefs.cad_busycap = 90;
+    /* Everything else that came off flash — bounds, NaNs, and the char fields,
+     * which the file format stores without terminators. */
+    sanitizeNodePrefs(&prefs);
 
     /* One-time format upgrade: old files (< 294 bytes) never saved the ZephCore
      * extension fields, and stored path_hash_mode/loop_detect as zero padding.
@@ -290,7 +371,15 @@ bool RepeaterDataStore::savePrefs(const NodePrefs& prefs) {
         return false;
     }
 
-    fs_unlink(tmp_path);
+    /* Guarded by fileExists() rather than unlinking blind: on the normal path
+     * the temp is absent, fs_unlink() returns -ENOENT, and Zephyr's FS layer
+     * logs that at ERR level regardless of us ignoring the return -- putting an
+     * <err> line on the happy path of every save, which is exactly the noise
+     * that makes a real filesystem error invisible.  Same guard as
+     * ZephyrDataStore::atomicWrite(). */
+    if (fileExists(tmp_path)) {
+        fs_unlink(tmp_path);
+    }
 
     struct fs_file_t file;
     fs_file_t_init(&file);
@@ -363,6 +452,21 @@ bool RepeaterDataStore::savePrefs(const NodePrefs& prefs) {
     fs_write(&file, &prefs.cad_offset, sizeof(prefs.cad_offset));
     fs_write(&file, &prefs.probe_interval, sizeof(prefs.probe_interval));
     fs_write(&file, &prefs.cad_busycap, sizeof(prefs.cad_busycap));
+    /* LR2021 side-detector SFs (offsets 301-303) */
+    fs_write(&file, prefs.extra_sf, sizeof(prefs.extra_sf));
+    /* External FEM RX gain (offset 304) */
+    fs_write(&file, &prefs.fem_rxgain, sizeof(prefs.fem_rxgain));
+    /* Mounting orientation (offsets 305-306) */
+    fs_write(&file, &prefs.display_rotate, sizeof(prefs.display_rotate));
+    fs_write(&file, &prefs.input_rotate, sizeof(prefs.input_rotate));
+    /* Family base detPeak cad_offset was learned against (offset 307) */
+    fs_write(&file, &prefs.cad_base, sizeof(prefs.cad_base));
+    /* Display timezone offset (offset 308) — signed whole hours from UTC,
+     * applied only when formatting the on-device clock */
+    fs_write(&file, &prefs.tz_offset, sizeof(prefs.tz_offset));
+    /* LED activity/heartbeat modes (offsets 309-310) */
+    fs_write(&file, &prefs.leds_radio_mode, sizeof(prefs.leds_radio_mode));
+    fs_write(&file, &prefs.leds_hb_mode, sizeof(prefs.leds_hb_mode));
 
     ret = fs_sync(&file);
     fs_close(&file);
@@ -382,37 +486,28 @@ bool RepeaterDataStore::savePrefs(const NodePrefs& prefs) {
 }
 
 bool RepeaterDataStore::formatFileSystem() {
-    LOG_WRN("Factory reset: erasing repeater data at %s", BASE_PATH);
+    LOG_WRN("Factory reset: erasing all storage");
 
-    struct fs_dir_t dir;
-    fs_dir_t_init(&dir);
-
-    int ret = fs_opendir(&dir, BASE_PATH);
-    if (ret < 0) {
-        LOG_WRN("No repeater directory to erase");
-        return true;
+    /* Erase the LittleFS *volume*, not just our files.  The old loop walked
+     * /lfs/repeater/ with fs_unlink, which left the volume itself untouched:
+     * it could not recover a volume another firmware had written into (on
+     * nRF52840 the Adafruit core's filesystem overlaps the top of ours), and
+     * it left /lfs/settings, stale companion files and all of /ext behind.
+     * Shared with the companion so all four roles erase the same regions. */
+    bool mounted = zephcore_fs_format_all(nullptr);
+    if (!mounted) {
+        LOG_ERR("Factory reset: /lfs did not remount");
+        return false;
     }
 
-    struct fs_dirent entry;
-    char path[280];
-
-    while (fs_readdir(&dir, &entry) == 0 && entry.name[0] != '\0') {
-        snprintf(path, sizeof(path), "%s/%s", BASE_PATH, entry.name);
-        LOG_INF("Deleting %s", path);
-        fs_unlink(path);
+    /* The format took /lfs/repeater with it.  Re-create it now rather than
+     * relying on the reboot: the CLI defers the reset so the reply can be
+     * transmitted, and anything that saves in that window needs the dir. */
+    _initialized = false;
+    if (!begin()) {
+        LOG_ERR("Factory reset: could not re-create %s", BASE_PATH);
+        return false;
     }
-    fs_closedir(&dir);
-
-#if FIXED_PARTITION_EXISTS(storage_partition)
-    /* Erase the NVS bonds partition too — a factory reset should clear BLE
-     * bonds, not just repeater files.  Caller reboots so NVS re-inits clean. */
-    const struct flash_area *fap;
-    if (flash_area_open(PARTITION_ID(storage_partition), &fap) == 0) {
-        LOG_INF("Formatting NVS storage (%u bytes)", (unsigned)fap->fa_size);
-        flash_area_flatten(fap, 0, fap->fa_size);
-        flash_area_close(fap);
-    }
-#endif
 
     LOG_INF("Repeater data erased");
     return true;

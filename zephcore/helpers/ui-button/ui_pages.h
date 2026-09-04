@@ -43,7 +43,9 @@ struct ui_state {
 	char     node_name[24];    /* device node name for top bar */
 	uint16_t battery_mv;
 	uint8_t  battery_pct;
-	uint32_t rtc_epoch;        /* Unix epoch from RTC (0 = not set) */
+	uint32_t rtc_epoch;        /* Unix epoch from RTC, ALWAYS UTC (0 = not set) */
+	int8_t   tz_offset;        /* whole hours from UTC, applied at format time
+				    * only -- rtc_epoch itself is never shifted */
 
 	/* Messages page */
 	uint16_t msg_count;
@@ -91,7 +93,7 @@ struct ui_state {
 	uint32_t gps_next_search_s;   /* seconds until next search (0=now/off) */
 
 	/* Buzzer page */
-	bool     buzzer_quiet;     /* true = muted */
+	uint8_t  buzzer_mode;      /* ZEPHCORE_BUZZER_{OFF,ON,VIBRATE} */
 
 	/* LEDs page */
 	bool     leds_disabled;    /* true = LEDs off */

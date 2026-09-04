@@ -32,6 +32,7 @@
 LOG_MODULE_REGISTER(zephcore_observer_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #include <app/RepeaterDataStore.h>
+#include "../adapters/datastore/ZephyrFsFormat.h"
 #include <app/ObserverMesh.h>
 #include <adapters/clock/ZephyrRTCClock.h>
 #include <mesh/RadioIncludes.h>
@@ -290,7 +291,7 @@ int main(void)
 {
 	/* Initialize radio prefs with observer-specific defaults */
 	initNodePrefs(&s_radio_prefs);
-	s_radio_prefs.cr           = 5;   /* CR 4/5 (initNodePrefs sets 8) */
+	s_radio_prefs.cr           = 5;   /* CR 4/5 (same as initNodePrefs; kept explicit) */
 	s_radio_prefs.tx_power_dbm = 0;   /* observer never TXes */
 	strncpy(s_radio_prefs.node_name, "Observer",
 		sizeof(s_radio_prefs.node_name) - 1);
@@ -305,6 +306,24 @@ int main(void)
 		gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
 	}
 #endif
+
+	/* First boot on a volume that is not this role's - a fresh chip, a
+	 * companion, or a node that was running Arduino MeshCore, whose nRF52
+	 * filesystems overlap our lfs_partition
+	 * (devdocs/HANDOVER_lfs_arduino_overlap.md).  Erase everything so we
+	 * start from a known state: Zephyr's automount only
+	 * auto-formats the LittleFS volume when it fails to mount, and never
+	 * touches storage_partition (BLE bonds NVS) or QSPI.
+	 *
+	 * Self-limiting, so it needs no "done" marker: the identity is generated
+	 * and saved a few lines below, and loadPrefs() persists defaults on the
+	 * same boot, so the next boot sees this role's data and skips this. */
+	if (!data_store.hasRoleData()) {
+		LOG_WRN("Volume holds no data for this role - formatting before first boot");
+		if (!zephcore_fs_format_all(nullptr)) {
+			LOG_ERR("First-boot format failed - /lfs is not mounted");
+		}
+	}
 
 	/* Initialize LittleFS data store */
 	if (!data_store.begin()) {
@@ -364,6 +383,8 @@ int main(void)
 	{
 		bool leds_off = prefs->leds_disabled != 0;
 		zephcore_leds_set_disabled(leds_off);
+		zephcore_leds_set_radio_mode(prefs->leds_radio_mode);
+		zephcore_leds_set_hb_mode(prefs->leds_hb_mode);
 		LOG_INF("LEDs: %s (from prefs)", leds_off ? "disabled" : "enabled");
 	}
 

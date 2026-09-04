@@ -156,6 +156,9 @@ int RoomServerMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp,
             if (env.has_pressure) {
                 lpp.addBarometricPressure(CH_SELF, env.pressure_hpa);
             }
+            if (env.has_luminosity) {
+                lpp.addLuminosity(CH_SELF, env.luminosity);
+            }
         } else {
             /* No env sensors at all — try MCU temp directly */
             float mcu_temp = _board.getMCUTemperature();
@@ -346,15 +349,23 @@ void RoomServerMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pk
 }
 
 void RoomServerMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size) {
-    if (recv_pkt_region && !recv_pkt_region->isWildcard()) {  // if _request_ packet scope is known, send reply with same scope
-        TransportKey scope;
-        if (region_map.getTransportKeysFor(*recv_pkt_region, &scope, 1) > 0) {
-            sendFloodScoped(scope, packet, delay_millis, path_hash_size);
-        } else {
-            sendFlood(packet, delay_millis, path_hash_size);  // send un-scoped
-        }
-    } else {
+    TransportKey req_scope;
+    bool req_scope_known = recv_pkt_region != nullptr && !recv_pkt_region->isWildcard()
+                        && region_map.getTransportKeysFor(*recv_pkt_region, &req_scope, 1) > 0;
+
+    switch (mesh::chooseReplyScope(req_scope_known, recv_pkt_unscoped_flood, !default_scope.isNull())) {
+    case mesh::REPLY_SCOPE_REQUEST:
+        sendFloodScoped(req_scope, packet, delay_millis, path_hash_size);  // same scope as the request
+        break;
+    case mesh::REPLY_SCOPE_DEFAULT:
+        // requester's scope is unknown: a DIRECT request (no transport codes), or a
+        // code that matched no Region. Un-scoped would be dropped at hop 0 by every
+        // repeater running flood.max.unscoped=0.
+        sendFloodScoped(default_scope, packet, delay_millis, path_hash_size);
+        break;
+    case mesh::REPLY_SCOPE_NONE:
         sendFlood(packet, delay_millis, path_hash_size);  // send un-scoped
+        break;
     }
 }
 
@@ -432,6 +443,7 @@ mesh::DispatcherAction RoomServerMesh::onRecvPacket(mesh::Packet* pkt) {
     // Determine the request packet's region so sendFloodReply() can echo the same
     // scope. Runs for every packet (not just floods) so recv_pkt_region is cleared
     // for direct packets instead of inheriting the last flood's region.
+    recv_pkt_unscoped_flood = (pkt->getRouteType() == ROUTE_TYPE_FLOOD);
     if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
         recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
     } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
@@ -589,7 +601,11 @@ void RoomServerMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int send
         memcpy(&sender_timestamp, data, 4);
         uint8_t flags = (data[4] >> 2);
 
-        if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA)) {
+        /* TXT_TYPE_CLI_COMMAND (v1.18+) is handled exactly like TXT_TYPE_CLI_DATA
+         * here: both stay behind client->isAdmin() below, and both are covered
+         * by the monotonic sender_timestamp / is_retry gates. */
+        if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA ||
+              flags == TXT_TYPE_CLI_COMMAND)) {
             LOG_DBG("onPeerDataRecv: unsupported text type: flags=%02x", flags);
         } else if (sender_timestamp >= client->last_timestamp) {
             bool is_retry = (sender_timestamp == client->last_timestamp);
@@ -606,7 +622,7 @@ void RoomServerMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int send
 
             uint8_t temp[5 + CLI_REMOTE_REPLY_SIZE];
             bool send_ack;
-            if (flags == TXT_TYPE_CLI_DATA) {  // admin CLI over the air
+            if (flags == TXT_TYPE_CLI_DATA || flags == TXT_TYPE_CLI_COMMAND) {  // admin CLI over the air
                 if (client->isAdmin()) {
                     if (is_retry) {
                         temp[5] = 0;
@@ -759,6 +775,7 @@ RoomServerMesh::RoomServerMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh:
     _logging = false;
     region_load_active = false;
     recv_pkt_region = nullptr;
+    recv_pkt_unscoped_flood = false;
     memset(default_scope.key, 0, sizeof(default_scope.key));
 
     initNodePrefs(&_prefs);
@@ -944,6 +961,14 @@ bool RoomServerMesh::setRxBoostedGain(bool enable) {
     return getRadioDriver(_radio).setRxBoost(enable);
 }
 
+bool RoomServerMesh::setFemRxGain(bool enable) {
+    return getRadioDriver(_radio).setFemRxEnable(enable);
+}
+
+bool RoomServerMesh::configSideDetectors(const uint8_t* sfs, uint8_t num) {
+    return getRadioDriver(_radio).configSideDetectors(sfs, num);
+}
+
 /* A room server keeps no neighbour table (it is not a repeater). */
 void RoomServerMesh::formatNeighborsReply(char* reply) {
     strcpy(reply, "not supported");
@@ -987,13 +1012,18 @@ void RoomServerMesh::resetDutyCycleTimeoutRestarts() {
 }
 
 /* Region-def CLI (handleRegionLoadLine / handleRegionCommand) and its static
- * parser helpers live in app/RepeaterRegionCLI.cpp. */
+ * parser helpers live in app/RoomServerRegionCLI.cpp. */
 
 void RoomServerMesh::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
     if (region_load_active) {
-        handleRegionLoadLine(command, reply);
+        handleRegionLoadLine(sender_timestamp, command, reply);
         return;
     }
+
+    /* Blank line: nothing to run.  The USB reader forwards these (see
+     * cli_rx_work_fn) because `region load` commits on one -- which is
+     * handled above, before this returns. */
+    if (StrHelper::isBlank(command)) { reply[0] = 0; return; }
 
     while (*command == ' ') command++;
 

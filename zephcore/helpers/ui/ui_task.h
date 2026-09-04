@@ -115,6 +115,15 @@ void ui_set_battery(uint16_t mv, uint8_t pct);
 void ui_set_clock(uint32_t epoch);
 
 /**
+ * Set the whole-hour offset from UTC used when formatting the on-device
+ * clock.  Display only: the epoch handed to ui_set_clock() stays UTC, and
+ * nothing here may ever reach RTCClock or a packet timestamp.
+ *
+ * @param hours  Offset from UTC, TZ_OFFSET_MIN..TZ_OFFSET_MAX (0 = UTC)
+ */
+void ui_set_tz(int8_t hours);
+
+/**
  * Record a recently heard contact for the "recent" page.
  *
  * @param name   Contact name (truncated to 15 chars)
@@ -163,9 +172,9 @@ void ui_set_gps_state(uint8_t state, uint32_t last_fix_age_s, uint32_t next_sear
 void ui_set_ble_enabled(bool enabled);
 
 /**
- * Set buzzer quiet state (for display page).
+ * Set notification mode (for display page).
  */
-void ui_set_buzzer_quiet(bool quiet);
+void ui_set_buzzer_mode(uint8_t mode);
 
 /**
  * Set LEDs disabled state (for display page).
@@ -305,6 +314,43 @@ void ui_notify_channel_msg(const char *channel_name, const char *text,
  * Rich UIs use this to start RTT timers; simpler ones ignore it.
  */
 void ui_notify_packet_sent(void);
+
+/* ===== Input axis flip =====
+ *
+ * A case that mounts the board upside down (e.g. the Meshnology N37E kit)
+ * rotates the joystick along with the screen, so "up" on the stick walks the
+ * menu down.  This flips the two axes back.
+ *
+ * Kept separate from the display rotation on purpose: the two are not always
+ * wanted together — a panel can be remounted alone, and boards whose display
+ * cannot rotate can still benefit from the axis swap.
+ *
+ * The state lives in ui_common.c so both UI variants (button and joystick)
+ * share one source of truth; each variant's input callback runs its raw
+ * event code through zephcore_input_map_code() before decoding it.
+ */
+
+/**
+ * Enable or disable the joystick/D-pad axis swap.
+ *
+ * @param flipped true to swap up/down and left/right
+ */
+void zephcore_input_set_flipped(bool flipped);
+
+/**
+ * @return true if the input axes are currently swapped.
+ */
+bool zephcore_input_is_flipped(void);
+
+/**
+ * Map a raw Zephyr INPUT_KEY_* code through the current axis flip.
+ * Returns @p code unchanged when the flip is off or the code is not
+ * a directional key.
+ *
+ * @param code Raw input event code
+ * @return The code the UI should decode
+ */
+uint16_t zephcore_input_map_code(uint16_t code);
 
 #ifdef __cplusplus
 }

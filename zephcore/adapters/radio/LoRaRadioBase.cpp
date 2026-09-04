@@ -6,6 +6,7 @@
 #include "LoRaRadioBase.h"
 #include "radio_common.h"
 #include <mesh/LoRaConfig.h>
+#include <mesh/MeshCore.h>   /* MAX_TRANS_UNIT */
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
 #include <string.h>
@@ -43,7 +44,7 @@ LoRaRadioBase::LoRaRadioBase(const struct device *lora_dev, MainBoard &board,
 			     NodePrefs *prefs)
 	: _loramac_node(false),
 	  _dev(lora_dev), _prefs(prefs), _board(&board),
-	  _in_recv_mode(0), _tx_active(0),
+	  _in_recv_mode(0), _tx_active(0), _tx_complete(0),
 	  _last_rssi(0), _last_snr(0),
 	  _rx_head(0), _rx_tail(0),
 	  _noise_floor(DEFAULT_NOISE_FLOOR), _calibration_threshold(0), _ema_unguarded(0),
@@ -53,19 +54,29 @@ LoRaRadioBase::LoRaRadioBase(const struct device *lora_dev, MainBoard &board,
 	  _rx_entry_cyc(0),
 	  _rssi_bursts(0), _rssi_spread_sum(0), _rssi_degenerate(0),
 	  _cad_auto(false), _cad_offset(0), _probe_interval_s(0),
-	  _cad_busycap_pct(0),
+	  _cad_busycap_pct(0), _cad_pending_level(INT8_MIN),
+	  _cad_pending_deadline_ms(0),
 	  _cad_last_probe_ms(0), _cad_last_decay_ms(0),
 	  _cad_probe_rr(0),
 	  _rx_duty_cycle_enabled(IS_ENABLED(CONFIG_ZEPHCORE_LORA_RX_DUTY_CYCLE)),
 	  _rx_boost_enabled(true),
 	  _dc_last_rx_us(0), _dc_last_sleep_us(0),
+	  _agc_rx_count_shadow(0), _agc_last_activity_ms(0),
+	  _agc_rssi_last(0), _agc_rssi_frozen(0),
+	  _rssi_reads_ok(0), _rssi_reads_busy(0), _rssi_bursts_abandoned(0),
+	  _rssi_dc_blocked(0),
+	  _silence_last_report_ms(0),
+	  _image_cal_last_temp_c(INT16_MIN),
+	  _image_cal_last_ms(0), _image_cal_wait_ms(0),
+	  _image_cal_started(false), _image_cal_confirming(false),
+	  _last_tx_start_ms(0),
 	  _config_cached(false),
 	  _has_radio_override(false),
 	  _override_freq(0), _override_bw(0),
 	  _override_sf(0), _override_cr(0),
 	  _rx_cb(nullptr), _rx_cb_user_data(nullptr),
 	  _tx_done_cb(nullptr), _tx_done_cb_user_data(nullptr),
-	  _tx_thread_running(false),
+	  _tx_thread_running(false), _tx_len(0),
 	  _packets_recv(0), _packets_sent(0), _packets_recv_errors(0)
 {
 	k_poll_signal_init(&_tx_signal);
@@ -75,6 +86,47 @@ LoRaRadioBase::LoRaRadioBase(const struct device *lora_dev, MainBoard &board,
 }
 
 /* ── TX wait thread ──────────────────────────────────────────── */
+
+/* How long to wait for TX_DONE before declaring the transmit lost.
+ *
+ * TX_TIMEOUT_MS alone is a fixed 5 s, which is shorter than the airtime of a
+ * great many legal presets — a 255-byte packet is 28.6 s at SF12/BW62.5 and
+ * 10.2 s at SF9/BW31.25 — so the wait would expire mid-transmission and
+ * startReceive() would yank the radio out of TX, losing a packet that was
+ * transmitting perfectly well.  Scale from the driver's own airtime instead,
+ * with the same doubling the drivers' internal sync-send waits use.
+ *
+ * MAX(), never a bare replacement: on fast presets the scaled value is smaller
+ * than 5 s (SF7/BW62.5, 64 bytes: ~1.4 s), and shortening this deadline on the
+ * presets every radio in the fleet is running today would be a regression for
+ * no gain.  The floor keeps existing behaviour exactly; only slow presets move.
+ *
+ * lora_airtime() is a pure calculation on the cached modem config, so calling
+ * it from this thread costs no SPI and cannot race the radio. */
+uint32_t LoRaRadioBase::txWaitBudgetMs() const
+{
+	/* _tx_len is published by startSendRaw() before it releases
+	 * _tx_start_sem, so by the time this thread runs it is always the length
+	 * of the transmit in flight — the fallback is defensive only, and uses
+	 * the protocol maximum rather than a literal so it tracks MAX_TRANS_UNIT
+	 * if the FIFO bound ever moves. */
+	uint32_t air = lora_airtime(_dev, _tx_len ? _tx_len : MAX_TRANS_UNIT);
+
+	/* All four drivers behind this class implement .airtime (native sx126x,
+	 * lr11xx, lr20xx, loramac-node sx127x), and lora_airtime() dereferences
+	 * the op without a NULL check, so there is no missing-op case to handle.
+	 * A zero can still come back from a degenerate modem config; fall back
+	 * to the flat budget rather than to no wait at all. */
+	if (air == 0) {
+		return TX_TIMEOUT_MS;
+	}
+	/* Cap the doubling before adding, so a pathological airtime cannot wrap
+	 * the 32-bit budget on its way into K_MSEC(). */
+	if (air > (UINT32_MAX - 1000U) / 2U) {
+		return UINT32_MAX - 1000U;
+	}
+	return MAX(TX_TIMEOUT_MS, 2U * air + 1000U);
+}
 
 void LoRaRadioBase::txWaitThreadFn(void *p1, void *p2, void *p3)
 {
@@ -103,21 +155,50 @@ void LoRaRadioBase::txWaitThreadFn(void *p1, void *p2, void *p3)
 		int result;
 		k_poll_signal_check(&self->_tx_signal, &signaled, &result);
 		if (signaled) {
-			LOG_DBG("TX wait: signal already raised (result=%d)", result);
+			/* The result carries the driver's verdict, and it has to
+			 * be honoured: a driver that reports a failed transmit
+			 * by raising the signal with a negative result (the
+			 * SX126x does exactly this on a chip Tx timeout,
+			 * -ETIMEDOUT) was previously counted here as a
+			 * successful send.  Latent rather than live — that
+			 * SX126x path is unreachable while an RX callback is
+			 * registered, which it always is — but it is the reason
+			 * the LR11xx and LR20xx timeout handlers deliberately do
+			 * NOT raise the signal.  With the result honoured, a
+			 * driver reporting failure is now the correct thing to
+			 * do on all three. */
+			if (result < 0) {
+				LOG_ERR("TX wait: driver reported failure (%d) — packet lost",
+					result);
+			} else {
+				LOG_DBG("TX wait: signal already raised (result=%d)", result);
+			}
 			k_poll_signal_reset(&self->_tx_signal);
+			/* Latch the verdict BEFORE the RX re-arm below, not after:
+			 * onAfterTransmit() + startReceive() is a full modem
+			 * reconfigure over SPI, and any loop() pass that lands
+			 * inside it used to see "not complete yet" and abandon a
+			 * transmit that had in fact finished.  startSendRaw()'s
+			 * _tx_active CAS is what makes publishing the completion
+			 * this early safe. */
+			if (result >= 0) {
+				atomic_set(&self->_tx_complete, 1);
+			}
 			self->_board->onAfterTransmit();
 			self->startReceive();
 			atomic_set(&self->_tx_active, 0);
-			atomic_inc(&self->_packets_sent);
 			if (self->_tx_done_cb) {
 				self->_tx_done_cb(self->_tx_done_cb_user_data);
 			}
 			continue;
 		}
 
-		int ret = k_poll(events, 1, K_MSEC(TX_TIMEOUT_MS));
+		uint32_t budget_ms = self->txWaitBudgetMs();
+
+		int ret = k_poll(events, 1, K_MSEC(budget_ms));
 		if (ret == -EAGAIN) {
-			LOG_ERR("TX wait: TIMEOUT!");
+			LOG_ERR("TX wait: TIMEOUT after %u ms (len=%u) — packet lost",
+				budget_ms, (unsigned)self->_tx_len);
 			self->_board->onAfterTransmit();
 			self->startReceive();
 			atomic_set(&self->_tx_active, 0);
@@ -128,12 +209,29 @@ void LoRaRadioBase::txWaitThreadFn(void *p1, void *p2, void *p3)
 		}
 
 		if (ret == 0 && events[0].state == K_POLL_STATE_SIGNALED) {
+			/* Same rule as the already-raised path above: a negative
+			 * result is the driver reporting a lost transmit, not a
+			 * completed one. */
+			int sig_result = 0;
+			unsigned int sig_state = 0;
+
+			k_poll_signal_check(&self->_tx_signal, &sig_state,
+					    &sig_result);
 			k_poll_signal_reset(&self->_tx_signal);
+			/* Latched ahead of the RX re-arm — see the equivalent
+			 * comment on the already-raised path above. */
+			if (sig_result >= 0) {
+				atomic_set(&self->_tx_complete, 1);
+			}
 			self->_board->onAfterTransmit();
 			self->startReceive();
 			atomic_set(&self->_tx_active, 0);
-			atomic_inc(&self->_packets_sent);
-			LOG_INF("TX complete, RX restarted");
+			if (sig_result < 0) {
+				LOG_ERR("TX failed: driver reported %d — packet lost",
+					sig_result);
+			} else {
+				LOG_INF("TX complete, RX restarted");
+			}
 
 			if (self->_tx_done_cb) {
 				self->_tx_done_cb(self->_tx_done_cb_user_data);
@@ -208,6 +306,12 @@ void LoRaRadioBase::rxCallbackStatic(const struct device *dev, uint8_t *data,
 	self->_last_rssi = (float)rssi;
 	self->_last_snr = (float)snr;
 	atomic_inc(&self->_packets_recv);
+
+	/* Activity LED ("set leds.radio rx|all").  Deliberately below the CRC and
+	 * header-error early return above, so the blink means a valid packet
+	 * landed rather than that something was heard on the channel.  Cheap and
+	 * non-blocking: the board raises a GPIO and arms a one-shot. */
+	self->_board->onPacketReceived();
 
 	if (self->_rx_cb) {
 		self->_rx_cb(self->_rx_cb_user_data);
@@ -589,7 +693,20 @@ void LoRaRadioBase::startReceive()
 					atomic_set(&_in_recv_mode, 1);
 					return;
 				}
-				if (ret != -ENOSYS) {
+				if (ret == -EBUSY) {
+					/* A concurrent TX owns the chip. Not the
+					 * CAD-busy case: when the LBT branch of
+					 * send_async restores RX in-driver it
+					 * leaves the chip in RX, and the driver's
+					 * idempotent fast-path (patch 0003)
+					 * re-arms duty cycle from there — AGC
+					 * reset included — rather than refusing.
+					 * So -EBUSY here means the radio is
+					 * genuinely mid-transmit; the fall-through
+					 * to lora_recv_async will fail the same
+					 * way and report it. */
+					LOG_DBG("rxduty: busy (TX in progress) — continuous RX");
+				} else if (ret != -ENOSYS) {
 					LOG_ERR("lora_recv_duty_cycle failed: %d", ret);
 				}
 				/* Fall through to continuous RX */
@@ -657,8 +774,25 @@ bool LoRaRadioBase::startSendRaw(const uint8_t *bytes, int len)
 		return false;
 	}
 
+	/* CAS, not a bare set: the wait thread publishes _tx_complete before it
+	 * re-arms RX, so the dispatcher can legitimately collect a completion
+	 * and come straight back here while that thread is still inside
+	 * startReceive().  A plain set would let this transmit be started and
+	 * then have its _tx_active cleared out from under it moments later --
+	 * and would leave the driver re-entering RX on top of a live TX.
+	 * Refusing instead is correct and cheap: the dispatcher re-queues and
+	 * the wind-down finishes in microseconds.  Placed before
+	 * onBeforeTransmit() so a refusal does not light the TX LED. */
+	if (!atomic_cas(&_tx_active, 0, 1)) {
+		LOG_DBG("startSendRaw: previous transmit still winding down");
+		return false;
+	}
+	/* A completion nobody collected belongs to the packet that just went
+	 * out, never to this one -- upstream's STATE_IDLE reset in the same
+	 * place. */
+	atomic_set(&_tx_complete, 0);
 	_board->onBeforeTransmit();
-	atomic_set(&_tx_active, 1);
+	_last_tx_start_ms = k_uptime_get_32();
 
 	/* Phase 2: when LBT is enabled, skip the pre-emptive hwCancelReceive()
 	 * and keep _in_recv_mode = 1 so the driver's send_async sees state == RX
@@ -680,11 +814,23 @@ bool LoRaRadioBase::startSendRaw(const uint8_t *bytes, int len)
 	configureTx();
 
 	memcpy(_tx_buf, bytes, len);
+	/* Published before the _tx_start_sem handoff below so txWaitBudgetMs()
+	 * sizes the wait for this packet, not the previous one. */
+	_tx_len = (uint16_t)len;
 	k_poll_signal_reset(&_tx_signal);
 
 	int ret = hwSendAsync(_tx_buf, (uint32_t)len, &_tx_signal);
 	if (ret < 0) {
-		LOG_ERR("hwSendAsync failed: %d", ret);
+		if (ret == -EBUSY) {
+			/* LBT refused the transmit because the channel is busy
+			 * — the designed outcome, not a fault. The dispatcher
+			 * re-queues and retries. On a busy site this fires
+			 * constantly, and at ERR it buries real faults and
+			 * makes a healthy repeater look broken. */
+			LOG_DBG("hwSendAsync: channel busy (LBT), re-queuing");
+		} else {
+			LOG_ERR("hwSendAsync failed: %d", ret);
+		}
 		_board->onAfterTransmit();
 		atomic_set(&_tx_active, 0);
 		/* startReceive() is safe to call here regardless of failure
@@ -708,7 +854,23 @@ bool LoRaRadioBase::startSendRaw(const uint8_t *bytes, int len)
 
 bool LoRaRadioBase::isSendComplete()
 {
-	return !atomic_get(&_tx_active);
+	/* One-shot, and it owns _packets_sent — the same contract as upstream's
+	 * RadioLibWrapper::isSendComplete(), which self-clears STATE_INT_READY
+	 * and does n_sent++ in the same breath.  Incrementing here rather than
+	 * in the wait thread is what keeps the radio's "packets sent" tally and
+	 * the dispatcher's flood/direct tallies in lockstep: both advance on
+	 * this one call, so a completion the dispatcher never collects (it hit
+	 * outbound_expiry first) is missed by both, exactly as upstream misses
+	 * it.  They used to be independent counters on independent threads,
+	 * which let "Total" and "Flood + Direct" disagree by thousands.
+	 *
+	 * This is a consuming call.  Anything that wants to know whether a
+	 * transmit is in flight must use isTxActive() instead. */
+	if (atomic_cas(&_tx_complete, 1, 0)) {
+		atomic_inc(&_packets_sent);
+		return true;
+	}
+	return false;
 }
 
 void LoRaRadioBase::onSendFinished()
@@ -731,6 +893,20 @@ float LoRaRadioBase::getLastSNR() const
 	return _last_snr;
 }
 
+int LoRaRadioBase::hwGetRssiBurst(int16_t *out, int n, uint32_t spacing_us)
+{
+	for (int i = 0; i < n; i++) {
+		if (i) {
+			k_busy_wait(spacing_us);
+		}
+		out[i] = hwGetCurrentRSSI();
+		if (out[i] == -128) {
+			return i;  /* refused partway; caller abandons */
+		}
+	}
+	return n;
+}
+
 bool LoRaRadioBase::isRadioReady()
 {
 	/* BUSY high means the radio cannot accept SPI commands now
@@ -742,9 +918,20 @@ bool LoRaRadioBase::isRadioReady()
 
 uint32_t LoRaRadioBase::getEstAirtimeFor(int len_bytes)
 {
-	uint8_t sf = _prefs ? _prefs->sf : LoRaConfig::SPREADING_FACTOR;
-	float bw = _prefs ? _prefs->bw : (float)LoRaConfig::BANDWIDTH;
-	uint8_t cr_val = _prefs ? _prefs->cr : LoRaConfig::CODING_RATE;
+	/* Read the params the radio is ACTUALLY running, not the saved prefs:
+	 * buildModemConfig() honours _has_radio_override, so a node under
+	 * `tempradio` transmits on the override preset while this used to
+	 * estimate for the stored one.  Everything downstream of the estimate
+	 * drifts with it — reported RX airtime, the TX airtime and duty-cycle
+	 * budget that now derive from it, and outbound_expiry.  Upstream cannot
+	 * drift this way because it asks the radio (getTimeOnAir()); these
+	 * accessors are our equivalent.  bw is read directly rather than via
+	 * getActiveBandwidthKHzX10(), whose fixed-point rounding would cost
+	 * precision at 31.25 kHz. */
+	uint8_t sf = getActiveSpreadingFactor();
+	float bw = _has_radio_override ? _override_bw
+		   : (_prefs ? _prefs->bw : (float)LoRaConfig::BANDWIDTH);
+	uint8_t cr_val = getActiveCodingRate();
 
 	if (sf < 6) sf = 6;
 	if (sf > 12) sf = 12;
@@ -827,8 +1014,17 @@ void LoRaRadioBase::triggerNoiseFloorCalibrate(int threshold)
 	}
 
 	/* Skip when the radio cannot accept commands right now
-	 * (e.g. duty-cycle sleep BUSY window). */
+	 * (e.g. duty-cycle sleep BUSY window).
+	 *
+	 * Counted, because this refusal was invisible and a whole line of
+	 * reasoning was built on the wrong counter: the r/b/a figures only move
+	 * when a read fails from INSIDE an already-started burst, so they say
+	 * nothing about how often the sampler is turned away here.  Whether the
+	 * noise floor actually goes stale under duty cycle — and therefore
+	 * whether the CAD prefilter admits probes at moments that are not quiet —
+	 * cannot be answered without this number. */
 	if (!isRadioReady()) {
+		_rssi_dc_blocked++;
 		return;
 	}
 
@@ -883,16 +1079,37 @@ void LoRaRadioBase::triggerNoiseFloorCalibrate(int threshold)
 	 * whole burst. */
 	uint32_t window_us = rssi_avg_window_us(bw_khz);
 	int16_t samples[NOISE_FLOOR_SAMPLES_PER_TICK];
-	for (int i = 0; i < NOISE_FLOOR_SAMPLES_PER_TICK; i++) {
-		if (i) {
-			k_busy_wait(window_us);
-		}
-		samples[i] = hwGetCurrentRSSI();
-		if (samples[i] == -128) {
-			/* Chip busy or RSSI read contended — keep the short
-			 * retry deadline set above and try again shortly. */
-			return;
-		}
+	int got = hwGetRssiBurst(samples, NOISE_FLOOR_SAMPLES_PER_TICK, window_us);
+
+	if (got < 0) {
+		/* A preamble or header landed inside the window, so these
+		 * samples measure that signal and not the floor.  Not a sampler
+		 * fault: charging it to the read counters would report a busy
+		 * channel as a failing bus, which is the distinction those
+		 * counters exist to draw.  Only the abandoned count moves, and
+		 * the short retry deadline set above stands.
+		 *
+		 * Leaving _sample_fresh clear is load-bearing beyond the floor.
+		 * On the LR families the CAD probe's own isReceiving() re-check
+		 * below cannot see this — with a duty cycle armed it answers
+		 * from a latch the sampler's re-arm has just zeroed — so this is
+		 * what actually keeps a calibration CAD off the air while a
+		 * neighbour is transmitting. */
+		_rssi_bursts_abandoned++;
+		return;
+	}
+
+	_rssi_reads_ok += (uint32_t)got;
+	if (got < NOISE_FLOOR_SAMPLES_PER_TICK) {
+		/* Chip busy or RSSI read contended — keep the short retry
+		 * deadline set above and try again shortly.
+		 *
+		 * Counted, not yet tolerated: whether to accept a partial burst
+		 * depends on how these reads fail, which is exactly what the
+		 * counters are here to establish. */
+		_rssi_reads_busy++;
+		_rssi_bursts_abandoned++;
+		return;
 	}
 
 	/* A full sample landed: next one is a full interval away. */
@@ -935,6 +1152,14 @@ void LoRaRadioBase::triggerNoiseFloorCalibrate(int threshold)
 		_rssi_bursts >>= 1;
 		_rssi_spread_sum >>= 1;
 		_rssi_degenerate >>= 1;
+		/* The read counters are printed alongside the burst count as
+		 * (N rX/bY/aZ), so a reader computes ratios across the two sets.
+		 * Halving only the burst side made those ratios wrong by 2x
+		 * after the first rescale and 4x after the next. */
+		_rssi_reads_ok >>= 1;
+		_rssi_reads_busy >>= 1;
+		_rssi_bursts_abandoned >>= 1;
+		_rssi_dc_blocked >>= 1;
 	}
 
 	/* Publish this sample for cadMaintenance().  The CAD probe needs exactly
@@ -951,6 +1176,19 @@ void LoRaRadioBase::triggerNoiseFloorCalibrate(int threshold)
 	_sample_channel_quiet = (_noise_floor == DEFAULT_NOISE_FLOOR) ||
 				(rssi <= _noise_floor + CAD_PROBE_RSSI_GUARD);
 	_sample_fresh = true;
+
+	/* Stuck-AGC evidence, gathered from a reading we already took.  A live
+	 * front end dithers by a dB or two between samples even on a quiet
+	 * channel; a desensitised one returns the same number forever.  Costs
+	 * nothing and needs no chip command of its own. */
+	if (rssi == _agc_rssi_last) {
+		if (_agc_rssi_frozen < 0xFF) {
+			_agc_rssi_frozen++;
+		}
+	} else {
+		_agc_rssi_last = rssi;
+		_agc_rssi_frozen = 0;
+	}
 
 	/* First sample after reset (DEFAULT_NOISE_FLOOR == 0): seed directly.
 	 * The lower clamp tracks the active bandwidth — thermal noise is
@@ -1011,13 +1249,277 @@ bool LoRaRadioBase::isReceiving()
 		return false;
 	}
 	/* Driver-side latch + non-destructive IRQ read covers the full
-	 * payload phase.  hwIsReceiving() never clears IRQ bits; foreign
-	 * preambles release via hardware (SymbNumTimeout on SX126x non-DC
-	 * or chip-internal sync timer on DC / LR11xx / LR20xx). */
+	 * payload phase.  hwIsReceiving() never clears IRQ bits on the poll
+	 * path itself; foreign preambles are released by the driver in
+	 * software, on an SF-aware grace plus a max-airtime header deadline
+	 * (SX126x patch 0013, LR11xx, LR20xx alike).  It is not a hardware
+	 * release — the chips latch these bits until ClearIrq, and continuous
+	 * RX has no timeout to do it for them. */
 	if (hwIsReceiving()) {
 		return true;
 	}
 	return isChannelActive();
+}
+
+/* ── Receiver hygiene ─────────────────────────────────────────────────
+ *
+ * Two independent faults, two independent triggers, neither on the packet path.
+ *
+ * 1. STUCK AGC.  Semtech's remedy is a warm sleep plus recalibration; it is not
+ *    in the datasheets, so it is not up for removal on datasheet reasoning.
+ *    What IS a design choice is when to fire it, and the honest answer is that
+ *    a periodic reset gets it backwards: a timer fires most often on a busy
+ *    channel, which is exactly where a received packet has just PROVED the AGC
+ *    is working, and it fires no more often on a silent one, where a
+ *    desensitised receiver is invisible and nothing else will reveal it.
+ *
+ *    So trigger on silence instead.  Arduino MeshCore's periodic
+ *    `agc_reset_interval` addressed the same fault and shipped defaulted to 0
+ *    (off), which is a fair summary of how well a plain timer serves it.
+ *
+ *    This used to claim the reset was free because an idle node "has no traffic
+ *    to miss".  That is false, and hardware disproved it: the reset fires at the
+ *    END of a silent stretch, which is precisely when traffic resumes, and
+ *    hwResetAgc() takes the radio out of RX for the whole warm-sleep +
+ *    Calibrate(ALL) + image-cal + re-entry sequence.  A packet was measured lost
+ *    to exactly that window on 2026-08-23 (T1000-E, 92 ms after the re-arm).
+ *
+ *    Silence is therefore treated as a prerequisite, not as proof.  Firing also
+ *    requires corroboration from evidence already on hand: the noise-floor
+ *    sampler reads RSSI every interval regardless, and a desensitised front end
+ *    reports a frozen value.  Both conditions together, and the operation
+ *    essentially never runs on a healthy node — which is the only acceptable
+ *    cost for a watchdog guarding a fault nobody has observed in the field.
+ *
+ *    Deliberately NOT reset here: the noise floor.  The previous periodic
+ *    implementation (removed in fe6e585) zeroed it on every fire, forcing a
+ *    fresh seed and a full EMA warmup each time — that, not the AGC work, is
+ *    what made it a net loss.  Arduino zeroes it too; we do not.
+ *
+ * 2. CALIBRATION DRIFT.  Image/front-end and PLL/AAF calibration are valid for
+ *    a temperature range, not forever: "Image calibration is necessary if there
+ *    is a frequency change > 10MHz, or a temperature change > 10 C", and the
+ *    LR2021 additionally advises redoing PLL and AAF beyond +/-20 C.  A node
+ *    that boots on a hot afternoon and runs into a cold night crosses both.
+ *    Nothing does this automatically: the LR2021's temperature-compensation
+ *    block (DS 6.12) only corrects crystal drift from TX self-heating, and it
+ *    refuses to run at all when a TCXO is fitted.
+ *
+ *    IMAGE_CAL_TEMP_DELTA_C is deliberately tighter than either datasheet
+ *    figure — cheap insurance, and the reading is a junction temperature that
+ *    lags ambient. */
+/* Silence alone is NOT evidence of a fault — see the rationale block above.
+ * Ten minutes, not one: a genuinely deaf receiver stays deaf, so waiting costs
+ * nothing, whereas a 60 s threshold fired 4-8 times per quarter hour on a
+ * perfectly healthy node (measured 2026-08-23). */
+#define AGC_IDLE_RESET_MS        600000U
+
+/* Consecutive identical noise-floor readings before silence is believed.  At
+ * the default 15 s sampler interval this is two minutes of a frozen front end. */
+#define AGC_STUCK_RSSI_SAMPLES   8U
+
+/* How often to report an ongoing RX silence.  Diagnostic only. */
+#define SILENCE_REPORT_MS        120000U
+
+/* Image-calibration drift threshold.  Nothing to do with the AGC reset above —
+ * this is the front end.  SX126x DS §9.2.1 / LR11xx UM: image calibration is
+ * required after a frequency change > 10 MHz or a temperature change > 10 C.
+ * Half the datasheet figure is used so drift is corrected before it reaches the
+ * point where the datasheet says the calibration is already stale. */
+#define IMAGE_CAL_TEMP_DELTA_C   5
+
+/* Temperature-drift poll cadence.  The maintenance pass itself runs every
+ * CONFIG_ZEPHCORE_NOISE_FLOOR_INTERVAL_MS (15 s by default); reading the
+ * junction temperature that often is 240 chip commands an hour to watch a
+ * quantity that physically cannot move IMAGE_CAL_TEMP_DELTA_C in minutes.
+ * Every one of those commands is an opportunity to collide with a duty-cycled
+ * radio's autonomous sleep transition, so the cheapest read is the one not
+ * issued.  The driver-side BUSY guards make the collision safe; this makes it
+ * rare. */
+#define IMAGE_CAL_POLL_MS        3600000U   /* 1 h between routine reads */
+#define IMAGE_CAL_CONFIRM_MS       15000U   /* re-read before acting on a delta */
+#define IMAGE_CAL_TX_QUIET_MS      60000U   /* let PA self-heating decay first */
+
+/* Two independent jobs share this hook because they share one precondition —
+ * the chip must be idle enough to accept a command — and one cadence source,
+ * the maintenance loop.  They are otherwise unrelated: agcIdleMaintenance()
+ * unsticks a receiver that has stopped hearing anything, imageCalMaintenance()
+ * corrects front-end image calibration against temperature drift.  Keep them in
+ * separate functions so neither's thresholds read as if they governed the
+ * other. */
+void LoRaRadioBase::radioMaintenance()
+{
+	/* Never mid-transmit or mid-receive: both operations warm-sleep the
+	 * chip, which aborts a TX and destroys an in-flight packet.  The RX
+	 * half cannot be inferred from the activity counters below — those
+	 * only move at RX_DONE/CRC_ERR, so a packet whose preamble is landing
+	 * right now still reads as silence.  isReceiving() is the latch that
+	 * knows (HEADER_VALID promotion + preamble grace); it is the same gate
+	 * checkSend() and the noise-floor sampler use before touching the chip.
+	 * Bailing here just defers the work to the next maintenance pass. */
+	if (atomic_get(&_tx_active) || isReceiving()) {
+		return;
+	}
+
+	uint32_t now = (uint32_t)k_uptime_get_32();
+
+	/* Deafness telemetry, every family, no action taken.
+	 *
+	 * agcIdleMaintenance() used to be the only thing that noticed a long
+	 * silence, and it is now family-gated — so on the LR parts nothing
+	 * reports it at all.  A silence marker on both boards is what lets a
+	 * side-by-side capture say WHICH radio stopped hearing, and the
+	 * accompanying counters say what the sampler was seeing at the time. */
+	uint32_t rx_now = (uint32_t)atomic_get(&_packets_recv) +
+			  (uint32_t)atomic_get(&_packets_recv_errors);
+
+	if (rx_now != _agc_rx_count_shadow || _agc_last_activity_ms == 0) {
+		_silence_last_report_ms = 0;   /* traffic — reset the reporter */
+	} else {
+		uint32_t silent_ms = now - _agc_last_activity_ms;
+
+		if (silent_ms >= SILENCE_REPORT_MS &&
+		    (_silence_last_report_ms == 0 ||
+		     (now - _silence_last_report_ms) >= SILENCE_REPORT_MS)) {
+			_silence_last_report_ms = now ? now : 1;
+			LOG_INF("silence: %u s no RX | in_rx=%d dc=%d rssi_ok=%u rssi_busy=%u abandoned=%u dc_blocked=%u floor=%d",
+				(unsigned)(silent_ms / 1000U),
+				(int)atomic_get(&_in_recv_mode),
+				(int)_rx_duty_cycle_enabled,
+				(unsigned)_rssi_reads_ok,
+				(unsigned)_rssi_reads_busy,
+				(unsigned)_rssi_bursts_abandoned,
+				(unsigned)_rssi_dc_blocked,
+				(int)_noise_floor);
+		}
+	}
+
+	agcIdleMaintenance(now);
+	imageCalMaintenance(now);
+}
+
+/* Receiver watchdog: a stuck AGC stops the demodulator hearing anything at all,
+ * so prolonged total silence is the symptom.  Nothing here concerns the front
+ * end or temperature. */
+void LoRaRadioBase::agcIdleMaintenance(uint32_t now)
+{
+	if (!hwNeedsAgcReset()) {
+		return;
+	}
+
+	/* Any demodulation activity counts as proof of life, errored frames
+	 * included — a CRC failure still means RF reached the demodulator, which
+	 * is precisely what a stuck AGC would prevent.  Counting only good
+	 * packets would fire resets on a node that is merely out of range. */
+	uint32_t rx_total = (uint32_t)atomic_get(&_packets_recv) +
+			    (uint32_t)atomic_get(&_packets_recv_errors);
+
+	if (rx_total != _agc_rx_count_shadow || _agc_last_activity_ms == 0) {
+		_agc_rx_count_shadow = rx_total;
+		_agc_last_activity_ms = now ? now : 1;
+	} else if ((now - _agc_last_activity_ms) >= AGC_IDLE_RESET_MS &&
+		   _agc_rssi_frozen >= AGC_STUCK_RSSI_SAMPLES) {
+		LOG_INF("agc: %u ms silent AND %u frozen floor samples at %d dBm — resetting AGC",
+			(unsigned)(now - _agc_last_activity_ms),
+			(unsigned)_agc_rssi_frozen, (int)_agc_rssi_last);
+		hwResetAgc();
+		/* hwResetAgc() leaves the chip out of RX by contract, so this is
+		 * a genuine re-entry and re-arms the duty cycle if one is set. */
+		startReceive();
+		_agc_last_activity_ms = now ? now : 1;
+	}
+}
+
+/* Front-end image calibration against temperature drift.  Separate from the AGC
+ * reset above in every respect: different symptom (degraded image rejection, not
+ * a deaf demodulator), different datasheet section, different remedy
+ * (hwRecalibrate(), not hwResetAgc()). */
+void LoRaRadioBase::imageCalMaintenance(uint32_t now)
+{
+	if (!hwHasDriftRecal()) {
+		return;
+	}
+
+	/* Polled on its own slow cadence rather than once per
+	 * maintenance pass — see IMAGE_CAL_POLL_MS.  Backends that cannot measure
+	 * (SX126x/SX127x) answer INT16_MIN from a plain inline with no bus
+	 * traffic, so the early return below costs them nothing. */
+	if (_image_cal_started && (now - _image_cal_last_ms) < _image_cal_wait_ms) {
+		return;
+	}
+
+	/* Wait out our own PA.  The junction is still warm for a while after a
+	 * transmit, and that self-heating is not the ambient drift the
+	 * recalibration exists to track — acting on it would recalibrate against
+	 * a temperature the chip will not be at a minute later.  Deferring
+	 * returns here without stamping, so the retry is the next pass (seconds)
+	 * rather than the next poll window (an hour). */
+	if (_last_tx_start_ms != 0 &&
+	    (now - _last_tx_start_ms) < IMAGE_CAL_TX_QUIET_MS) {
+		return;
+	}
+
+	/* Temperature comes from the BOARD, never from the radio.
+	 *
+	 * Only the delta matters here, never the absolute value, and the MCU die
+	 * sensor tracks the same ambient the front end sits in — so it answers
+	 * the question just as well as the radio's junction sensor while costing
+	 * the radio nothing at all.  Reading it off the chip meant a periodic SPI
+	 * command aimed at a part that spends most of its time in an autonomous
+	 * duty-cycle sleep phase; that read wedged the LR1110 BUSY-high 7 times
+	 * in 47 minutes of measurement on 2026-08-23, each costing 12-18 s of
+	 * deafness, and it cost a packet.  The junction sensor was also the worse
+	 * instrument for the job: it sees PA self-heating, which is exactly the
+	 * transient this path must not react to. */
+	float board_temp = _board ? _board->getMCUTemperature() : NAN;
+
+	if (isnan(board_temp)) {
+		/* No board temperature source — drift handling simply does not run
+		 * on this hardware, as it did not before on families without a
+		 * junction sensor either. */
+		return;
+	}
+
+	int16_t temp_c = (int16_t)lroundf(board_temp);
+
+	_image_cal_started = true;
+	_image_cal_last_ms = now;
+	_image_cal_wait_ms = IMAGE_CAL_POLL_MS;
+
+	if (_image_cal_last_temp_c == INT16_MIN) {
+		_image_cal_last_temp_c = temp_c;   /* first reading is the baseline */
+		return;
+	}
+
+	int delta = (int)temp_c - (int)_image_cal_last_temp_c;
+
+	if (delta < 0) {
+		delta = -delta;
+	}
+	if (delta < IMAGE_CAL_TEMP_DELTA_C) {
+		_image_cal_confirming = false;
+		return;
+	}
+
+	/* Measure twice before acting.  A single reading over the threshold can
+	 * be a transient — residual self-heating the quiet window did not fully
+	 * cover, or a one-off bad sample — and hwRecalibrate() takes the radio
+	 * out of receive.  Re-read shortly and act only if the second reading
+	 * agrees. */
+	if (!_image_cal_confirming) {
+		_image_cal_confirming = true;
+		_image_cal_wait_ms = IMAGE_CAL_CONFIRM_MS;
+		LOG_DBG("imagecal: chip temp delta %d C — confirming before recalibrating",
+			delta);
+		return;
+	}
+
+	_image_cal_confirming = false;
+	LOG_INF("imagecal: chip temp moved %d C (%d -> %d) — recalibrating",
+		delta, (int)_image_cal_last_temp_c, (int)temp_c);
+	hwRecalibrate();
+	startReceive();
+	_image_cal_last_temp_c = temp_c;
 }
 
 void LoRaRadioBase::recoverRxState()
@@ -1053,11 +1555,83 @@ bool LoRaRadioBase::isChannelActive(int threshold)
 
 /* ── Adaptive CAD (LBT detPeak calibration) ───────────────────────────── */
 
-void LoRaRadioBase::setCadParams(bool auto_enabled, int8_t offset,
-				 uint16_t probe_interval_s, uint8_t busycap_pct)
+/* The offset window is [CAD_LEVEL_MIN, CAD_LEVEL_MAX], but an offset is only
+ * meaningful while base+offset still lands somewhere the driver will actually
+ * program.  Past the hardware clamp several offsets collapse onto one peak, and
+ * the staircase cannot tell them apart — it reads sampling noise as curvature.
+ * Narrow the window so every level it can reach is a distinct configuration.
+ *
+ * Radios that report no clamp (hwCadPeakMin/Max == 0) keep the static window,
+ * which is also what a radio with no adaptive CAD at all gets. */
+int8_t LoRaRadioBase::cadLevelMinEff()
 {
-	if (offset < CAD_LEVEL_MIN) offset = CAD_LEVEL_MIN;
-	if (offset > CAD_LEVEL_MAX) offset = CAD_LEVEL_MAX;
+	uint8_t base = hwCadBasePeak();
+	uint8_t pmin = hwCadPeakMin();
+
+	/* The clamp only binds when the lowest peak the static window can reach,
+	 * base + CAD_LEVEL_MIN, would land below it.  Note the sign: this was
+	 * written `base - CAD_LEVEL_MIN` once, which with CAD_LEVEL_MIN negative
+	 * evaluates to base + 8 — always above pmin, so the narrowing never
+	 * happened and the whole function was inert. */
+	if (base == 0 || pmin == 0 ||
+	    (int)base + CAD_LEVEL_MIN >= (int)pmin) {
+		return CAD_LEVEL_MIN;
+	}
+	return (int8_t)((int)pmin - (int)base);
+}
+
+int8_t LoRaRadioBase::cadLevelMaxEff()
+{
+	uint8_t base = hwCadBasePeak();
+	uint8_t pmax = hwCadPeakMax();
+
+	if (base == 0 || pmax == 0 || (int)pmax - (int)base >= CAD_LEVEL_MAX) {
+		return CAD_LEVEL_MAX;
+	}
+	return (int8_t)((int)pmax - (int)base);
+}
+
+void LoRaRadioBase::setCadParams(bool auto_enabled, int8_t offset,
+				 uint16_t probe_interval_s, uint8_t busycap_pct,
+				 uint8_t stored_base)
+{
+	const int8_t lo = cadLevelMinEff();
+	const int8_t hi = cadLevelMaxEff();
+	const uint8_t base = hwCadBasePeak();
+
+	/* Re-anchor across a base-table change.
+	 *
+	 * cad_offset is persisted; the per-level probe statistics that justified
+	 * it are not (RAM only, cleared by reconfigure() and lost at every
+	 * reboot).  So when a firmware update moves the family base table, a
+	 * converged node wakes up with an offset that names a different absolute
+	 * detPeak than the one it spent days measuring.
+	 *
+	 * Preserve the PEAK, not the offset: the peak is the physical quantity
+	 * the node actually measured, and the offset is only how we address it.
+	 * A node at base 51 / offset -7 lands on base 44 / offset 0 — the same
+	 * detPeak 44, now centred in its window instead of one rung off the rail.
+	 *
+	 * Resetting to 0 instead would throw away real convergence for no reason,
+	 * and is only the right answer when the preserved peak falls outside the
+	 * window the new base can reach — which the clamp below handles, because
+	 * a peak that is no longer addressable is not a peak we can operate at.
+	 *
+	 * stored_base == 0 means "never recorded" (a node upgrading from a build
+	 * without the field), and is deliberately a no-op: with no record of
+	 * which base the offset came from, any adjustment would be a guess. */
+	if (stored_base != 0 && base != 0 && stored_base != base) {
+		int adj = (int)offset + (int)stored_base - (int)base;
+
+		LOG_INF("cad: base %u -> %u, re-anchoring offset %d -> %d "
+			"(peak %d held)",
+			(unsigned)stored_base, (unsigned)base,
+			(int)offset, adj, (int)stored_base + (int)offset);
+		offset = (int8_t)(adj < -128 ? -128 : (adj > 127 ? 127 : adj));
+	}
+
+	if (offset < lo) offset = lo;
+	if (offset > hi) offset = hi;
 
 	_cad_auto = auto_enabled;
 	_cad_offset = offset;
@@ -1078,9 +1652,14 @@ void LoRaRadioBase::setCadParams(bool auto_enabled, int8_t offset,
 
 	hwCadSetPeakOffset(_cad_offset);
 
-	LOG_INF("cad: auto=%d offset=%d measure_interval=%ums busycap=%u%%",
-		(int)auto_enabled, (int)offset, (unsigned)_measure_interval_ms,
-		(unsigned)busycap_pct);
+	LOG_INF("cad: auto=%d offset=%d base=%u measure_interval=%ums busycap=%u%%",
+		(int)auto_enabled, (int)offset, (unsigned)base,
+		(unsigned)_measure_interval_ms, (unsigned)busycap_pct);
+}
+
+uint8_t LoRaRadioBase::cadBasePeak()
+{
+	return hwCadBasePeak();
 }
 
 void LoRaRadioBase::resetCadStats()
@@ -1104,6 +1683,22 @@ int8_t LoRaRadioBase::pickCadProbeLevel()
 	_cad_probe_rr++;
 
 	if (!_cad_auto) {
+		/* The sweep window is ABSOLUTE, so an operating offset parked
+		 * outside it is never probed at all — measured: 49 minutes at
+		 * offset -8 produced 0 probes at -8, which left cadSafetyStep()
+		 * with no evidence and made it a no-op in precisely the
+		 * configuration it exists for (auto off + an offset that cannot
+		 * clear).
+		 *
+		 * When the operator has parked outside the window, probe where
+		 * they actually are instead: the swept curve does not contain
+		 * their operating point, so it cannot inform the hand-tuning it
+		 * was built for either.  Inside the window the sweep already
+		 * covers the operating level and is left exactly as it was. */
+		if (_cad_offset < CAD_SWEEP_MIN || _cad_offset > CAD_SWEEP_MAX) {
+			return _cad_offset;
+		}
+
 		/* Dry-run: even sweep across the observation window so the
 		 * user sees the whole FP-vs-detPeak curve in `get cad`. */
 		int span = CAD_SWEEP_MAX - CAD_SWEEP_MIN + 1;
@@ -1121,7 +1716,7 @@ int8_t LoRaRadioBase::pickCadProbeLevel()
 	case 3:  lvl = (int8_t)(_cad_offset + 1); break;  /* less sensitive */
 	default: lvl = _cad_offset; break;                /* operating (0, 2) */
 	}
-	if (lvl < CAD_LEVEL_MIN || lvl > CAD_LEVEL_MAX) {
+	if (lvl < cadLevelMinEff() || lvl > cadLevelMaxEff()) {
 		lvl = _cad_offset;
 	}
 	return lvl;
@@ -1160,28 +1755,20 @@ void LoRaRadioBase::cadStaircaseStep()
 	if (r_op < 0) {
 		return;  /* operating level not warm yet — no basis to step */
 	}
-	int b_op = busy_rate(oi);
 	int r_up = fp_rate(oi + 1);  /* one step less sensitive */
 	int r_dn = fp_rate(oi - 1);  /* frontier, one step more sensitive */
 
-	/* Airtime protection (highest priority): if the operating level defers
-	 * too large a fraction of TX attempts — real traffic included — back off
-	 * to a less sensitive detPeak.  On a congested hilltop most of that busy
-	 * is distant traffic we'd win on capture anyway; deferring for all of it
-	 * just starves our own airtime.  Cap is `set cad.busycap` percent (0 =
-	 * off); only binds on genuinely busy channels. */
+	/* Airtime protection used to live here as the highest-priority rung.  It
+	 * has moved to cadSafetyStep(), which the callers run BEFORE this and
+	 * without the _cad_auto gate — it is a safety, not an optimisation, and
+	 * gating it meant a node whose detPeak could never clear had no way back
+	 * once the operator turned auto off.  What remains here is purely the
+	 * knee-seeking optimiser. */
 	int cap_permille = (int)_cad_busycap_pct * 10;
-	if (cap_permille && _cad_offset < CAD_LEVEL_MAX && b_op > cap_permille) {
-		_cad_offset++;
-		hwCadSetPeakOffset(_cad_offset);
-		LOG_INF("cad: step up -> offset %d (airtime, busy %d cap %d)",
-			(int)_cad_offset, b_op, cap_permille);
-		return;
-	}
 
 	/* Step UP (less sensitive) when the level above is markedly cleaner —
 	 * we're on the steep part of the curve, below the knee. */
-	if (_cad_offset < CAD_LEVEL_MAX && r_up >= 0 &&
+	if (_cad_offset < cadLevelMaxEff() && r_up >= 0 &&
 	    r_op - r_up >= CAD_KNEE_SLOPE_PERMILLE) {
 		_cad_offset++;
 		hwCadSetPeakOffset(_cad_offset);
@@ -1198,8 +1785,9 @@ void LoRaRadioBase::cadStaircaseStep()
 	 * airtime cap and bouncing straight back up. */
 	int b_dn = busy_rate(oi - 1);
 	bool busy_ok = (cap_permille == 0) ||
-		       (b_dn <= cap_permille - CAD_BUSY_DEFER_HYST_PERMILLE);
-	if (_cad_offset > CAD_LEVEL_MIN && r_dn >= 0 &&
+		       (b_dn <= cap_permille -
+				(cap_permille * CAD_BUSY_DEFER_HYST_PCT) / 100);
+	if (_cad_offset > cadLevelMinEff() && r_dn >= 0 &&
 	    r_dn - r_op < CAD_KNEE_SLOPE_PERMILLE &&
 	    r_op <= CAD_PLATEAU_CLEAN_PERMILLE && busy_ok) {
 		_cad_offset--;
@@ -1211,6 +1799,86 @@ void LoRaRadioBase::cadStaircaseStep()
 
 	/* Otherwise: at the knee (steep below, flat above) or a noisy flat
 	 * plateau — hold. */
+}
+
+bool LoRaRadioBase::cadSafetyStep()
+{
+	/* The airtime-protection rung, run unconditionally — see the constant
+	 * block in radio_common.h for why it is not gated on _cad_auto.
+	 *
+	 * This is the proactive half of the pair.  cadRelaxOnTxStarvation() only
+	 * fires once the node actually has traffic it cannot send, which on a
+	 * silent mesh may be up to flood_advert_interval away (47 h by default);
+	 * this one works off probe statistics, which accumulate whether or not
+	 * there is anything to transmit. */
+	if (_cad_offset >= cadLevelMaxEff()) {
+		return false;
+	}
+
+	int oi = _cad_offset - CAD_LEVEL_MIN;
+	if (oi < 0 || oi >= CAD_NUM_LEVELS) {
+		return false;
+	}
+
+	uint16_t probes = _cad_stats[oi].probes;
+	if (probes == 0) {
+		return false;
+	}
+
+	int b_op = (int)(((uint32_t)_cad_stats[oi].busy * 1000U) / probes);
+	int cap_permille = (int)_cad_busycap_pct * 10;
+
+	/* Unambiguous: this level trips on nearly every probe, so it cannot
+	 * clear for a transmit either.  Acts on few samples and ignores the
+	 * cap. */
+	bool pathological = probes >= CAD_SAFETY_MIN_PROBES &&
+			    b_op >= CAD_SAFETY_PATHOLOGICAL_PERMILLE;
+	/* Marginal: a real airtime-vs-capture tradeoff.  Keeps the original
+	 * evidence bar and honours `cad.busycap 0` as the operator's choice. */
+	bool over_cap = cap_permille && probes >= CAD_STEP_MIN_PROBES &&
+			b_op > cap_permille;
+
+	if (!pathological && !over_cap) {
+		return false;
+	}
+
+	_cad_offset++;
+	hwCadSetPeakOffset(_cad_offset);
+	if (pathological) {
+		LOG_WRN("cad: safety step up -> offset %d (busy %d permille over "
+			"%u probes — detector too sensitive to clear, auto=%d)",
+			(int)_cad_offset, b_op, (unsigned)probes, (int)_cad_auto);
+	} else {
+		LOG_INF("cad: step up -> offset %d (airtime, busy %d cap %d)",
+			(int)_cad_offset, b_op, cap_permille);
+	}
+	return true;
+}
+
+bool LoRaRadioBase::cadRelaxOnTxStarvation()
+{
+	/* Deliberately does NOT consult _cad_auto.  Every other mover of
+	 * _cad_offset is an optimiser and correctly stays out of the way when
+	 * the operator has taken manual control; this one exists precisely for
+	 * the case where manual control produced a node that cannot transmit,
+	 * so honouring `cad.auto off` here would disable the safety exactly
+	 * where it is needed.  It also ignores cad.busycap and the per-level
+	 * probe statistics: 120 warm probes are half an hour away, and the
+	 * caller has already established the harm directly.
+	 *
+	 * One step at a time, never a jump to base: on a genuinely congested
+	 * site the operator's sensitive setting may be almost right, and the
+	 * smallest change that restores transmission is the one to make. */
+	if (_cad_offset >= cadLevelMaxEff()) {
+		return false;
+	}
+
+	_cad_offset++;
+	hwCadSetPeakOffset(_cad_offset);
+	LOG_WRN("cad: TX starvation override -> offset %d (auto=%d) — LBT was "
+		"refusing every transmit",
+		(int)_cad_offset, (int)_cad_auto);
+	return true;
 }
 
 void LoRaRadioBase::cadMaintenance()
@@ -1227,6 +1895,50 @@ void LoRaRadioBase::cadMaintenance()
 	} else if (now - _cad_last_decay_ms > (int64_t)CAD_STATS_DECAY_MS) {
 		decayCadStats();
 		_cad_last_decay_ms = now;
+	}
+
+	/* A CAD_RX probe from an earlier pass, now resolvable.
+	 *
+	 * This replaces the four-poll confirmation window that used to run
+	 * inline after every busy probe.  That window existed only because the
+	 * old CAD_ONLY exit threw away the reception which triggered the
+	 * detection, leaving nothing to wait for and no choice but to guess from
+	 * a poll -- and it guessed badly, confirming about a quarter of busies on
+	 * the best node and one in forty-five on a duty-cycled LR1110.
+	 *
+	 * With CAD_RX the chip keeps that reception and always resolves it with
+	 * a terminal interrupt: a packet, or its own cadTimeout.  So there is a
+	 * real event to observe, the answer is read once after the chip's own
+	 * deadline, and it costs no chip access at all. */
+	if (_cad_pending_level != INT8_MIN && now >= _cad_pending_deadline_ms) {
+		CadLevelStats &ps = _cad_stats[_cad_pending_level - CAD_LEVEL_MIN];
+		int outcome = hwCadRxOutcome();
+
+		if (outcome == 1) {
+			ps.tp++;
+		} else if (outcome == 2) {
+			ps.fp++;
+		} else {
+			/* Past the chip's own deadline with neither terminal
+			 * interrupt seen.  Nothing to infer from that, and
+			 * inventing a verdict would poison the very curve the
+			 * staircase reads -- so un-count the sample entirely
+			 * rather than book it as either.  Dropping the busy with
+			 * it keeps busy_rate and fp_rate describing the same
+			 * population. */
+			if (ps.probes) ps.probes--;
+			if (ps.busy) ps.busy--;
+			LOG_WRN("cad: probe at %+d unresolved past deadline, discarded",
+				(int)_cad_pending_level);
+		}
+		_cad_pending_level = INT8_MIN;
+
+		/* Safety first, and outside the _cad_auto gate.  When it acts,
+		 * skip the optimiser this pass — it has just moved the operating
+		 * level and the three-rung window it reads is stale. */
+		if (!cadSafetyStep() && _cad_auto) {
+			cadStaircaseStep();
+		}
 	}
 
 	/* No separate probe-interval check: the probe interval IS the measurement
@@ -1252,7 +1964,48 @@ void LoRaRadioBase::cadMaintenance()
 	}
 	_sample_fresh = false;
 
+	/* One probe in flight at a time.  A second CAD while the first is still
+	 * in its CAD_RX window would abort that Rx -- destroying the reception
+	 * being measured -- and there is only one pending slot to book it to. */
+	if (_cad_pending_level != INT8_MIN) {
+		return;
+	}
+
+	/* No CAD_RX ground truth on this radio means no probing at all.
+	 *
+	 * The staircase reads a FALSE-positive rate, so a probe whose outcome
+	 * can never be established is not a weaker sample, it is a poisoned one:
+	 * every busy verdict would be booked as neither fp nor tp, fp_rate would
+	 * read zero at every level, the curve would look perfectly clean, and
+	 * the controller would walk to the most sensitive rail on a channel it
+	 * has learned nothing about.  Silently collecting unusable data is worse
+	 * than collecting none.
+	 *
+	 * The one radio this currently excludes is the LR2021.  Its cad_timeout
+	 * is 24 bits of 32 MHz periods (DS 6.3.11), i.e. 524 ms, while a
+	 * max-length packet at the default SF7/BW62.5 preset runs 1704 ms -- and
+	 * the datasheet is explicit that the chip "stays in Rx until a packet is
+	 * demodulated or the timer reaches the timeout", so that bound truncates
+	 * receptions rather than merely ending a wait.  Enabling CAD_RX there
+	 * would trade a measurement for lost packets, which is the wrong way
+	 * round.  `set cad.offset` still works by hand.
+	 *
+	 * (The SX126x's ceiling is 262 s at 15.625 us steps and the LR11xx's is
+	 * 512 s at 32768 Hz RTC steps, so neither comes close to binding.) */
+	if (hwCadRxTimeoutMs() == 0) {
+		return;
+	}
+
 	if (!_sample_channel_quiet) {
+		return;
+	}
+
+	/* Re-check immediately before the CAD.  The sampler's own isReceiving()
+	 * guard ran BEFORE its 8-read burst, so by the time we get here it is
+	 * about a millisecond stale — long enough for a packet to have started.
+	 * Calibration must never cost a reception, and abandoning the probe is
+	 * free: the next interval is 15 s away and nothing depends on this one. */
+	if (isReceiving()) {
 		return;
 	}
 
@@ -1260,13 +2013,23 @@ void LoRaRadioBase::cadMaintenance()
 
 	int8_t level = pickCadProbeLevel();
 	int ret = hwCadProbe(level);
+	/* hwCadProbe() BLOCKS for the whole CAD, so `now` is already stale here
+	 * and must not be used as the base of the CAD_RX deadline below. */
+	int64_t probe_done_ms = k_uptime_get();
 
-	/* The probe leaves the chip in STANDBY (driver state REST) — re-arm
-	 * RX immediately so an incoming packet isn't lost while we classify.
-	 * In duty-cycle mode this re-enters the DC cycle (same path as the
-	 * parked-RX watchdog re-arm). */
-	atomic_set(&_in_recv_mode, 0);
-	startReceive();
+	/* Where the chip is now depends on the verdict, and the caller must not
+	 * guess:
+	 *   free (0)  -> standby; re-enter RX exactly as before.
+	 *   busy (2)  -> the chip is ALREADY in RX, locked on the signal CAD
+	 *                found, and re-entering would tear down the reception
+	 *                this probe exists to observe.  Leave it alone.
+	 *   busy (1)  -> a radio still on the CAD_ONLY exit (no CAD_RX support):
+	 *                standby, re-enter RX, and no ground truth is available.
+	 *   error     -> standby; re-enter RX and give up on this pass. */
+	if (ret != 2) {
+		atomic_set(&_in_recv_mode, 0);
+		startReceive();
+	}
 
 	if (ret < 0) {
 		if (ret != -ENOSYS) {
@@ -1284,56 +2047,34 @@ void LoRaRadioBase::cadMaintenance()
 
 	if (ret > 0) {
 		s.busy++;
-
-		/* Ground-truth post-check: was the CAD hit a REAL signal or a
-		 * correlator false positive?  A real transmitter that tripped
-		 * CAD keeps radiating, so over the next preamble+header window
-		 * one of two things shows up:
-		 *   (a) the restarted RX syncs on it   -> isReceiving(), or
-		 *   (b) instantaneous RSSI climbs above the noise floor.
-		 * (b) is the important addition: the probe tears RX down to run
-		 * CAD, and the STANDBY->RX restart routinely eats the preamble of
-		 * a real packet, so RX never re-syncs — the old isReceiving()-only
-		 * snapshot booked those strong-but-missed packets as false
-		 * positives, a ~detPeak-independent floor that flattened the FP
-		 * curve and drove the staircase to the ceiling.  Channel energy
-		 * doesn't depend on winning the preamble race, so it recovers
-		 * them.  Neither signal over the whole window => genuine FP.  A
-		 * below-floor packet we can neither sync nor see stays ambiguous
-		 * and counts as FP — bias toward higher detPeak (the safe side).
-		 * The prefilter above guaranteed RSSI <= floor+guard pre-probe,
-		 * so a rise past that threshold now is a newly-arrived signal. */
-		uint8_t sf = getActiveSpreadingFactor();
-		uint16_t bw_x10 = getActiveBandwidthKHzX10();
-		uint32_t tsym_us = bw_x10 ? (uint32_t)(((1UL << sf) * 10000UL)
-						       / bw_x10) : 1024;
-		uint32_t step_ms = (3U * tsym_us) / 1000U;  /* ~3 symbols/sample */
-
-		if (step_ms < 5) step_ms = 5;
-		if (step_ms > 100) step_ms = 100;
-
-		bool floor_valid = (_noise_floor != DEFAULT_NOISE_FLOOR);
-		int16_t rssi_thresh = _noise_floor + CAD_PROBE_RSSI_GUARD;
-
-		bool real = false;
-		for (int k = 0; k < 4 && !real; k++) {  /* ~12 symbols total */
-			k_sleep(K_MSEC(step_ms));
-			if (isReceiving()) {
-				real = true;
-			} else if (floor_valid &&
-				   hwGetCurrentRSSI() > rssi_thresh) {
-				real = true;
-			}
-		}
-
-		if (real) {
-			s.tp++;
-		} else {
-			s.fp++;
-		}
 	}
 
-	if (_cad_auto) {
+	if (ret == 2) {
+		/* Book the rung and come back once the chip's own cadTimeout has
+		 * passed, when a terminal interrupt is guaranteed to have landed.
+		 * The extra 100 ms is interrupt-to-work-queue latency, not a
+		 * safety margin against the chip: the deadline itself is the
+		 * chip's.
+		 *
+		 * Measured from AFTER the probe, because the chip's cadTimeout
+		 * starts when CAD_DONE hands it into Rx — which is exactly when
+		 * the blocking hwCadProbe() returns.  Based on `now` instead, it
+		 * was short by the whole CAD duration, and a 4-symbol CAD is
+		 * ~131 ms at SF11/BW62.5 and ~262 ms at SF12 (the figure
+		 * sx126x_cad_timeout_ms() sizes its own wait from), i.e. more
+		 * than the margin.  The outcome was then read before the chip
+		 * could raise its timeout, so every FALSE positive was discarded
+		 * while true positives — which land early, on a packet — still
+		 * counted: fp_rate read ~0 at every rung and the staircase
+		 * descended to the sensitive rail on a curve it had not
+		 * measured. */
+		_cad_pending_level = level;
+		_cad_pending_deadline_ms =
+			probe_done_ms + (int64_t)hwCadRxTimeoutMs() + 100;
+		return;
+	}
+
+	if (!cadSafetyStep() && _cad_auto) {
 		cadStaircaseStep();
 	}
 }
@@ -1375,7 +2116,17 @@ uint32_t LoRaRadioBase::msUntilNextMaintenance()
 	 * off the noise-floor sampler's measurement (see cadMaintenance), so its
 	 * wake is already accounted for above.  Giving it a second deadline is
 	 * what produced two independent 15 s grids ~3 s apart — one extra wake
-	 * per interval, forever, on every repeater. */
+	 * per interval, forever, on every repeater.
+	 *
+	 * A CAD_RX probe awaiting its terminal event is the one exception, and it
+	 * is not a second grid: it is one wake, only while a probe is actually
+	 * pending, at the moment the chip has guaranteed an answer exists.  It
+	 * would otherwise wait for the next sampler tick, leaving the node in the
+	 * plain RX that CAD_RX entered instead of handing the duty cycle back. */
+	if (_cad_pending_level != INT8_MIN) {
+		next = mesh::maintenanceSooner(
+			next, clampDeadline(_cad_pending_deadline_ms - now));
+	}
 
 	/* Stats decay. _cad_last_decay_ms == 0 means the first call latches it
 	 * rather than decaying, so treat that as due now. */
@@ -1445,22 +2196,50 @@ int LoRaRadioBase::formatCadStatus(char *buf, int cap)
 		      (int)base + _cad_offset, base,
 		      spread_mean10 / 10U, spread_mean10 % 10U, degen_pct);
 	if (room_for_count) {
-		n += snprintf(buf + n, cap > n ? cap - n : 0, "(%u)",
-			      (unsigned)_rssi_bursts);
+		/* bursts(ok reads/busy reads/abandoned bursts/dc-blocked) — the
+		 * busy and abandoned figures distinguish a sampler that is losing
+		 * the odd read from one that is being refused mid-burst, and the
+		 * dc figure distinguishes both from one that never gets to start
+		 * because the duty-cycle sleep window turns it away.  Without the
+		 * last one, "refused constantly" and "running perfectly" both
+		 * print b0/a0. */
+		n += snprintf(buf + n, cap > n ? cap - n : 0,
+			      "(%u r%u/b%u/a%u/d%u)",
+			      (unsigned)_rssi_bursts,
+			      (unsigned)_rssi_reads_ok,
+			      (unsigned)_rssi_reads_busy,
+			      (unsigned)_rssi_bursts_abandoned,
+			      (unsigned)_rssi_dc_blocked);
 	}
 	n += snprintf(buf + n, cap > n ? cap - n : 0, " bc:%u%%",
 		      (unsigned)_cad_busycap_pct);
+	/* Probing off because the radio cannot supply CAD_RX ground truth (see
+	 * cadMaintenance).  Stated rather than left to be inferred from level
+	 * counters that never move. */
+	if (hwCadRxTimeoutMs() == 0) {
+		n += snprintf(buf + n, cap > n ? cap - n : 0, " probe:n/a");
+	}
 
 	/* Only the 3 rungs around the operating offset — the far rungs are mildly
-	 * irrelevant; what matters is where we sit on the ladder. The window is
-	 * clamped to stay inside [CAD_LEVEL_MIN, CAD_LEVEL_MAX] while still showing
-	 * 3 rungs, so at either end it slides inward rather than dropping a line. */
+	 * irrelevant; what matters is where we sit on the ladder.  The window is
+	 * clamped to the EFFECTIVE range while still showing 3 rungs, so at either
+	 * end it slides inward rather than dropping a line.
+	 *
+	 * Effective, not the static constants: past the hardware detPeak clamp
+	 * several offsets program the same peak, and showing them as separate
+	 * rungs invited exactly the wrong reading — three lines of distinct
+	 * statistics for one physical configuration.  With the range narrowed,
+	 * every rung printed is a real one and `pk` below is what the chip got. */
+	const int lmin = cadLevelMinEff();
+	const int lmax = cadLevelMaxEff();
 	int cur = _cad_offset;
-	if (cur < CAD_LEVEL_MIN) cur = CAD_LEVEL_MIN;
-	if (cur > CAD_LEVEL_MAX) cur = CAD_LEVEL_MAX;
+	if (cur < lmin) cur = lmin;
+	if (cur > lmax) cur = lmax;
 	int lo = cur - 1, hi = cur + 1;
-	if (lo < CAD_LEVEL_MIN) { lo = CAD_LEVEL_MIN; hi = lo + 2; }
-	if (hi > CAD_LEVEL_MAX) { hi = CAD_LEVEL_MAX; lo = hi - 2; }
+	if (lo < lmin) { lo = lmin; hi = lo + 2; }
+	if (hi > lmax) { hi = lmax; lo = hi - 2; }
+	if (lo < CAD_LEVEL_MIN) lo = CAD_LEVEL_MIN;
+	if (hi > CAD_LEVEL_MAX) hi = CAD_LEVEL_MAX;
 
 	for (int lvl = lo; lvl <= hi; lvl++) {
 		CadLevelStats &s = _cad_stats[lvl - CAD_LEVEL_MIN];

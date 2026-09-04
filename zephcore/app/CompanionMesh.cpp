@@ -84,6 +84,7 @@ LOG_MODULE_REGISTER(zephcore_companion, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 #define CMD_SET_DEFAULT_FLOOD_SCOPE 0x3F  /* v11+ */
 #define CMD_GET_DEFAULT_FLOOD_SCOPE 0x40  /* v11+ */
 #define CMD_SEND_RAW_PACKET         0x41  /* v12+ */
+#define CMD_RUN_CLI_COMMAND         0x42  /* v14+ */
 
 /* Response packet types */
 #define PACKET_OK               0x00
@@ -115,6 +116,7 @@ LOG_MODULE_REGISTER(zephcore_companion, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 #define PACKET_ALLOWED_REPEAT_FREQ 0x1A
 #define PACKET_CHANNEL_DATA_RECV   0x1B
 #define PACKET_DEFAULT_FLOOD_SCOPE 0x1C
+#define PACKET_CLI_REPLY           0x1D  /* v14+, reply to CMD_RUN_CLI_COMMAND */
 
 #define MAX_CHANNEL_DATA_LENGTH    (MAX_FRAME_SIZE - 9)
 
@@ -187,7 +189,6 @@ CompanionMesh::CompanionMesh(mesh::Radio &radio, mesh::MillisecondClock &ms, mes
 	_offline_queue_count = 0;
 	_sync_pending = false;
 	memset(_ack_table, 0, sizeof(_ack_table));
-	_ack_next_overwrite = 0;
 	memset(_advert_paths, 0, sizeof(_advert_paths));
 	_next_advert_path_idx = 0;
 	_sign_data = nullptr;
@@ -211,7 +212,7 @@ CompanionMesh::CompanionMesh(mesh::Radio &radio, mesh::MillisecondClock &ms, mes
 	_dirty_channels_expiry = 0;
 	memset(_send_scope.key, 0, sizeof(_send_scope.key));
 	_send_scope_force_unscoped = false;
-	_vcontact_cli_cb = nullptr;
+	_cli_exec_cb = nullptr;
 	memset(_vcontact_pubkey, 0, sizeof(_vcontact_pubkey));
 	_vcontact_lastmod = 0;
 	memset(_vcontact_recent_ts, 0, sizeof(_vcontact_recent_ts));
@@ -219,6 +220,10 @@ CompanionMesh::CompanionMesh(mesh::Radio &radio, mesh::MillisecondClock &ms, mes
 	memset(_vcontact_pending, 0, sizeof(_vcontact_pending));
 	_vcontact_pending_count = 0;
 	_vcontact_hold_msgwait = false;
+	_vcontact_app_hidden = false;
+	_vcontact_confirm_ack = 0;
+	_vcontact_confirm_work.self = this;
+	k_work_init_delayable(&_vcontact_confirm_work.work, vcontactConfirmWorkHandler);
 	memset(&prefs, 0, sizeof(prefs));
 	prefs.node_lat = 0;
 	prefs.node_lon = 0;
@@ -229,8 +234,9 @@ void CompanionMesh::begin()
 	BaseChatMesh::begin();
 
 	/* Derive the v-contact pubkey from our identity: stable per node, unique
-	 * per device. Deliberately NOT a real keypair — no private key exists
-	 * anywhere, so nothing addressed to this key is decryptable by anyone. */
+	 * per device. A real Ed25519 point (strict clients reject anything else),
+	 * but its private half is derived-and-dropped — never stored, never used —
+	 * and only this node can recompute it. */
 	deriveVContactKey();
 	/* Stamp lastmod only if a time source already ran (hardware RTC restore
 	 * happens before begin()). Otherwise stay deferred (lastmod = 0) until
@@ -384,12 +390,24 @@ void CompanionMesh::onChannelAdded(ChannelDetails *)
 	markChannelsDirty();
 }
 
-void CompanionMesh::markContactsDirty()
+void CompanionMesh::markContactsDirty(bool substantive)
 {
+	int64_t deadline = _ms->getMillis() +
+			   (substantive ? LAZY_WRITE_DELAY_MS
+					: LAZY_WRITE_LIVENESS_MS);
+
 	/* Only set the timer on first dirty — don't keep pushing
 	 * the deadline forward or a busy mesh never flushes. */
 	if (!_dirty_contacts_expiry) {
-		_dirty_contacts_expiry = _ms->getMillis() + LAZY_WRITE_DELAY_MS;
+		_dirty_contacts_expiry = deadline;
+		return;
+	}
+
+	/* ...but a substantive change must not have to sit out a liveness wait
+	 * that is already pending.  Pulling the deadline IN cannot starve the
+	 * flush, only hasten it. */
+	if (substantive && deadline < _dirty_contacts_expiry) {
+		_dirty_contacts_expiry = deadline;
 	}
 }
 
@@ -652,13 +670,22 @@ void CompanionMesh::addPendingAck(uint32_t expected, int contact_idx)
 			return;
 		}
 	}
-	// Table full — circular overwrite
-	int idx = _ack_next_overwrite;
+	// Table full — evict the entry that has been waiting longest. A rotating
+	// write cursor is not equivalent: it advances independently of when each
+	// slot was filled, so under a burst it can discard an ACK registered
+	// moments ago while a much older one survives. Whichever entry we drop
+	// can never be confirmed, so drop the one least likely to still be
+	// answered.
+	int idx = 0;
+	for (int i = 1; i < ACK_TABLE_SIZE; i++) {
+		if ((int32_t)(_ack_table[i].sent_time - _ack_table[idx].sent_time) < 0) {
+			idx = i;
+		}
+	}
 	_ack_table[idx].expected_ack = expected;
 	_ack_table[idx].contact_idx = contact_idx;
 	_ack_table[idx].sent_time = now_ms;
 	_ack_table[idx].active = true;
-	_ack_next_overwrite = (idx + 1) % ACK_TABLE_SIZE;
 }
 
 int CompanionMesh::findAndRemoveAck(uint32_t ack, uint32_t *out_sent_time)
@@ -715,8 +742,13 @@ void CompanionMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8
 	LOG_INF("onDiscoveredContact: '%s' is_new=%d path_len=%d num_contacts=%d",
 		contact.name, is_new, path_len, getNumContacts());
 
-	// Mark contacts dirty for lazy save
-	markContactsDirty();
+	/* A re-heard advert from a contact we already have is liveness only —
+	 * the base class has just refreshed last_advert_timestamp and lastmod,
+	 * and nothing else typically moved.  Persist it lazily rather than
+	 * spending a full-file rewrite per advert; a genuinely new contact, a
+	 * path change (onContactPathUpdated) or a message all still flush on the
+	 * short deadline. */
+	markContactsDirty(is_new);
 
 	// Update advert path table
 	if (path && mesh::Packet::isValidPathLen(path_len)) {
@@ -856,7 +888,12 @@ void CompanionMesh::buildVContact(ContactInfo &c) const
 {
 	memcpy(c.id.pub_key, _vcontact_pubkey, PUB_KEY_SIZE);
 	c.type = ADV_TYPE_CHAT;
-	c.flags = 0;
+	/* App-owned flags (bit 0 = favourite, upper bits = telemetry permissions).
+	 * The v-contact has no contacts-table record to hold them, so they live in
+	 * prefs — see the CMD_ADD_UPDATE_CONTACT interception below. Echoing a
+	 * hardcoded 0 here is what used to clear the favourite star on every
+	 * contact sync. */
+	c.flags = prefs.v_contact_flags;
 	c.out_path_len = 0;  /* zero-hop direct — renders as "0 hops" in the app */
 	c.shared_secret_valid = false;
 	memset(c.out_path, 0, sizeof(c.out_path));
@@ -942,8 +979,13 @@ void CompanionMesh::vcontactQueueText(const char *text)
 	 * makes the app interleave message-sync into the contact stream and
 	 * truncate it. The message is already safe in the offline queue and the
 	 * app's own initial message-sync drains it — so no prompt is needed inside
-	 * the window. Outside it, the prompt goes out immediately. */
-	if (!_vcontact_hold_msgwait) {
+	 * the window. Outside it, the prompt goes out immediately.
+	 *
+	 * Also suppressed while the app has deleted the v-contact this session:
+	 * prompting for messages from a contact the app just dropped is noise. The
+	 * messages stay in the offline queue and drain on the next connect, when
+	 * the contact is back. */
+	if (!_vcontact_hold_msgwait && !_vcontact_app_hidden) {
 		sendPush(PUSH_CODE_MSG_WAITING);
 	}
 }
@@ -971,20 +1013,121 @@ void CompanionMesh::vcontactNotify(const char *text)
 	vcontactQueueText(text);
 }
 
+/* How long the delivery-ack is held back after its PACKET_SENT.
+ *
+ * A plain timer on purpose.  The tempting trigger — "flush as soon as the app
+ * sends us another frame, that proves it is done with the response" — is
+ * useless here: we emit MSG_WAITING for the CLI reply a few lines further
+ * down, and the app answers that with CMD_SYNC_NEXT_MESSAGE inside one
+ * connection interval.  That inbound frame would arrive ~50 ms in and flush
+ * the confirm almost as early as sending it inline did, which is the bug.
+ *
+ * Bounded on the other side by the 3000 ms est_timeout we advertise in
+ * PACKET_SENT: the confirm must land well before the app gives up and resends,
+ * or the resend races it. */
+#define VCONTACT_CONFIRM_DELAY_MS 300
+
+void CompanionMesh::vcontactConfirmWorkHandler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	ConfirmWork *cw = CONTAINER_OF(dwork, ConfirmWork, work);
+	cw->self->vcontactFlushConfirm();
+}
+
+void CompanionMesh::vcontactFlushConfirm()
+{
+	/* Single 32-bit read/clear: a concurrent flush from the work handler and
+	 * the frame path can at worst emit the push twice, which the app treats as
+	 * idempotent.  Losing it is the failure that matters, so no lock. */
+	uint32_t ack = _vcontact_confirm_ack;
+	if (ack == 0) {
+		return;
+	}
+	_vcontact_confirm_ack = 0;
+	k_work_cancel_delayable(&_vcontact_confirm_work.work);
+
+	uint8_t ack_push[8];
+	memcpy(ack_push, &ack, 4);
+	memset(&ack_push[4], 0, 4);        /* trip time: 0 ms — never left the box */
+	LOG_DBG("vcontact: emitting deferred ack 0x%08x", ack);
+	sendPush(PUSH_CODE_SEND_CONFIRMED, ack_push, 8);
+}
+
 void CompanionMesh::deriveVContactKey()
 {
-	/* v-contact pubkey = SHA256("zc-vcontact" || self pubkey). Re-run whenever
-	 * the identity changes (boot, CMD_IMPORT_PRIVATE_KEY) so the key always
-	 * tracks the current identity. */
+	/* v-contact pubkey = the Ed25519 public point of a keypair derived from
+	 * SHA256("zc-vcontact" || self prv_key || counter). Re-run whenever the
+	 * identity changes (boot, CMD_IMPORT_PRIVATE_KEY) so the key always tracks
+	 * the current identity.
+	 *
+	 * This used to be the bare hash SHA256("zc-vcontact" || self pubkey) placed
+	 * straight into a pub_key field. That is wrong on the wire: a uniformly
+	 * random 32-byte string decompresses to a valid Ed25519 point only about
+	 * half the time (the recovered x^2 must be a quadratic residue), so ~50% of
+	 * nodes advertised a v-contact whose key strict clients reject outright —
+	 * they decompress peer keys on contact upsert and on DM build, and error
+	 * with "peer pub_key is not a valid Ed25519 point". ZephCore itself never
+	 * noticed because it only ever memcmp()s this key (see isVContactKey();
+	 * buildVContact() sets shared_secret_valid = false). Deriving the point via
+	 * scalarbase instead makes it valid by construction, for every node.
+	 *
+	 * Seeded from the PRIVATE key, not the public one: the seed then sits
+	 * behind a value no one else holds, so an outsider cannot link a v-contact
+	 * to the node it belongs to, and cannot derive the matching private key.
+	 * Nothing needs that link — the app receives the v-contact through an
+	 * explicit PUSH_CODE_NEW_ADVERT and never derives it. The private half is
+	 * computed here and dropped: it is never stored, never signs, and never
+	 * takes part in a key exchange. Publishing the point leaks nothing about
+	 * the identity — reaching prv from it means solving the Ed25519 discrete
+	 * log AND inverting SHA-512 AND inverting SHA-256.
+	 *
+	 * The counter byte serves the reserved-prefix guard: MeshCore treats
+	 * pub_key[0] of 0x00/0xFF as a protocol marker (same rule as
+	 * ZephyrRNG::generateFirstBootIdentity and validatePrivateKey), and a
+	 * deterministic derivation cannot simply "draw again" without one. Each
+	 * bump re-rolls the whole key; P(a single miss) = 2/256, so the loop
+	 * essentially always ends on the first pass and stays deterministic. */
 	static const char vc_salt[] = "zc-vcontact";
-	mesh::Utils::sha256(_vcontact_pubkey, PUB_KEY_SIZE,
-		(const uint8_t *)vc_salt, sizeof(vc_salt) - 1,
-		self_id.pub_key, PUB_KEY_SIZE);
+	uint8_t material[PRV_KEY_SIZE + 1];
+	uint8_t seed[SEED_SIZE];
+	mesh::LocalIdentity vc;
+
+	/* writeTo()'s buffer format is prv || pub; capping max_len at PRV_KEY_SIZE
+	 * asks for the private half alone. */
+	if (self_id.writeTo(material, PRV_KEY_SIZE) != PRV_KEY_SIZE) {
+		/* Cannot happen — kept so a future signature change fails loudly
+		 * rather than seeding off an uninitialised stack buffer. */
+		LOG_ERR("vcontact: private key unavailable, key not derived");
+		mesh::Utils::secureZeroize(material, sizeof(material));
+		return;
+	}
+
+	for (int counter = 0; counter < 256; counter++) {
+		material[PRV_KEY_SIZE] = (uint8_t)counter;
+		mesh::Utils::sha256(seed, SEED_SIZE,
+			(const uint8_t *)vc_salt, sizeof(vc_salt) - 1,
+			material, sizeof(material));
+		vc.fromSeed(seed);
+		if (vc.pub_key[0] != 0x00 && vc.pub_key[0] != 0xFF) break;
+	}
+	memcpy(_vcontact_pubkey, vc.pub_key, PUB_KEY_SIZE);
+
+	/* material holds the real identity private key, and vc holds the v-key's
+	 * discarded private half. Neither has any business outliving this call.
+	 * LocalIdentity keeps prv_key private and has no wipe of its own, so the
+	 * object is cleared wholesale — it has no virtuals, so there is no vtable
+	 * pointer to destroy. */
+	mesh::Utils::secureZeroize(material, sizeof(material));
+	mesh::Utils::secureZeroize(seed, sizeof(seed));
+	mesh::Utils::secureZeroize(&vc, sizeof(vc));
 }
 
 void CompanionMesh::vcontactPushAdvert()
 {
 	if (!isVContactEnabled()) return;
+	/* The app deleted it this session — don't push it straight back at them.
+	 * It returns on its own at the next CMD_APP_START. */
+	if (_vcontact_app_hidden) return;
 	if (!vcontactClockValid()) {
 		/* Defer — an advert stamped now would carry a 1970 timestamp.
 		 * vcontactClockSynced() re-runs this once a time source arrives. */
@@ -1015,7 +1158,8 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 		 * attempt(1) + timestamp(4) + pub_key_prefix(6) + text(N). */
 		if (len >= 14 && isVContactKey(&data[7], 6)) {
 			uint8_t txt_type = data[1];
-			if (txt_type != TXT_TYPE_PLAIN && txt_type != TXT_TYPE_CLI_DATA) {
+			if (txt_type != TXT_TYPE_PLAIN && txt_type != TXT_TYPE_CLI_DATA &&
+			    txt_type != TXT_TYPE_CLI_COMMAND) {
 				sendPacketError(ERR_UNSUPPORTED);
 				return true;
 			}
@@ -1035,8 +1179,13 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 			 * the real send path. The old code sent a RANDOM ack, which never
 			 * matched the value the app derives locally, so the app treated the
 			 * loopback message as un-acked and resent it once (attempt=1) a few
-			 * seconds later → duplicate reply. Emitting the correct SENT +
-			 * CONFIRMED up front (before the CLI runs) settles the app at once. */
+			 * seconds later → duplicate reply.
+			 *
+			 * The value is right, but the CONFIRMED that carries it is NOT sent
+			 * inline — see _vcontact_confirm_ack. Sent here it lands
+			 * sub-millisecond after the PACKET_SENT response to the same write,
+			 * before the app has committed the outgoing message, and the app
+			 * drops it. Deferred by a few hundred ms it sticks first time. */
 			uint8_t hbuf[5 + MAX_TEXT_LEN];
 			memcpy(hbuf, &data[3], 4);          /* timestamp, on-wire LE bytes */
 			hbuf[4] = (data[2] & 3);            /* attempt & 3 */
@@ -1047,10 +1196,16 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 			if (ack == 0) ack = 1;
 
 			sendPacketSent(MSG_SEND_SENT_DIRECT, ack, 3000);
-			uint8_t ack_push[8];
-			memcpy(ack_push, &ack, 4);
-			memset(&ack_push[4], 0, 4);         /* trip time: 0 ms */
-			sendPush(PUSH_CODE_SEND_CONFIRMED, ack_push, 8);
+			/* One slot, not a queue: a second v-contact message inside
+			 * VCONTACT_CONFIRM_DELAY_MS would overwrite the first ack before
+			 * its work ever ran, so that message stayed un-confirmed until the
+			 * app hit est_timeout and resent it. Flush the pending one first —
+			 * it is already past the sub-millisecond window that made deferring
+			 * necessary, so emitting it now is safe. */
+			vcontactFlushConfirm();
+			_vcontact_confirm_ack = ack;
+			k_work_reschedule(&_vcontact_confirm_work.work,
+					  K_MSEC(VCONTACT_CONFIRM_DELAY_MS));
 
 			/* Dedupe app resends: a retry reuses the message timestamp (only
 			 * the attempt byte changes). The correct ack above should stop most
@@ -1090,10 +1245,10 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 				}
 
 				LOG_INF("vcontact CLI: '%s'", line);
-				char reply[VCONTACT_CLI_REPLY_SIZE];
+				char reply[COMPANION_CLI_REPLY_SIZE];
 				reply[0] = '\0';
-				if (_vcontact_cli_cb) {
-					_vcontact_cli_cb(line, reply);
+				if (_cli_exec_cb) {
+					_cli_exec_cb(line, reply);
 				} else {
 					strcpy(reply, "CLI not available");
 				}
@@ -1140,10 +1295,29 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 		return false;
 
 	case CMD_ADD_UPDATE_CONTACT:
+		/* Never let the v-contact into the real contacts table (it must stay out
+		 * of the RF RX matching path) — but do keep the one field the app owns
+		 * and expects back: the flags byte (bit 0 = favourite, upper bits =
+		 * telemetry permissions). Everything else in the frame (name, path,
+		 * lat/lon, advert timestamp) is ours to generate in buildVContact().
+		 * Frame layout matches the real handler: [cmd][32-byte pubkey][type]
+		 * [flags][...]. Reply OK so app-side flows don't surface errors. */
+		if (len >= 1 + PUB_KEY_SIZE && isVContactKey(&data[1], PUB_KEY_SIZE)) {
+			if (len >= 1 + PUB_KEY_SIZE + 2) {
+				uint8_t flags = data[1 + PUB_KEY_SIZE + 1];
+				if (flags != prefs.v_contact_flags) {
+					prefs.v_contact_flags = flags;
+					_store->savePrefs(prefs);
+				}
+			}
+			sendPacketOk();
+			return true;
+		}
+		return false;
+
 	case CMD_RESET_PATH:
-		/* Never let the v-contact into the real contacts table (it must stay
-		 * out of the RF RX matching path); path resets are meaningless for a
-		 * loopback contact. Reply OK so app-side flows don't surface errors. */
+		/* Path resets are meaningless for a loopback contact — accept and drop
+		 * so app-side flows don't surface errors. */
 		if (len >= 1 + PUB_KEY_SIZE && isVContactKey(&data[1], PUB_KEY_SIZE)) {
 			sendPacketOk();
 			return true;
@@ -1151,11 +1325,19 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 		return false;
 
 	case CMD_REMOVE_CONTACT:
-		/* App-side delete turns the feature off (mirrors user intent);
-		 * `set v.contact on` (USB CLI) brings it back. */
+		/* App-side delete hides the v-contact for the rest of this session and
+		 * nothing more — see _vcontact_app_hidden. It used to set
+		 * prefs.v_contact_enabled = 0, which made a routine "purge all
+		 * contacts" in the app silently disable the feature for good: the
+		 * v-contact is an ordinary list entry, so a purge removes it like any
+		 * other, and only the USB CLI could turn it back on. Durable disable
+		 * stays with the node-side pref (`set v.contact off`).
+		 *
+		 * Flags are deliberately kept: the same contact returns on the next
+		 * connect, so its favourite star should return with it. */
 		if (len >= 1 + PUB_KEY_SIZE && isVContactKey(&data[1], PUB_KEY_SIZE)) {
-			prefs.v_contact_enabled = 0;
-			_store->savePrefs(prefs);
+			_vcontact_app_hidden = true;
+			LOG_INF("vcontact: hidden by app delete (this session only)");
 			sendPacketOk();
 			return true;
 		}
@@ -1174,7 +1356,7 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 			if (tag == 0) tag = 1;
 			sendPacketSent(MSG_SEND_SENT_DIRECT, tag, 3000);
 
-			uint8_t rsp[8 + 4 + 11 + 11 + (12 * POWER_MAX_CHANNELS) + 8];
+			uint8_t rsp[8 + 4 + 11 + 15 + (12 * POWER_MAX_CHANNELS) + 8];
 			int i = 0;
 			rsp[i++] = PUSH_CODE_TELEMETRY_RESPONSE;
 			rsp[i++] = 0;  /* reserved */
@@ -1516,6 +1698,16 @@ int CompanionMesh::appendSelfTelemetry(uint8_t *reply, uint8_t permissions)
 				reply[i++] = (press >> 8) & 0xFF;
 				reply[i++] = press & 0xFF;
 			}
+			if (env.has_luminosity) {
+				reply[i++] = CH_SELF;
+				reply[i++] = LPP_LUMINOSITY;
+				float lum = env.luminosity;
+				if (lum < 0.0f) lum = 0.0f;
+				if (lum > 65535.0f) lum = 65535.0f;
+				uint16_t lux = (uint16_t)lum;
+				reply[i++] = (lux >> 8) & 0xFF;
+				reply[i++] = lux & 0xFF;
+			}
 		}
 
 		// Power monitor telemetry (INA219/INA3221/ina2xx)
@@ -1525,16 +1717,18 @@ int CompanionMesh::appendSelfTelemetry(uint8_t *reply, uint8_t permissions)
 				uint8_t ch = CH_SELF + 1;
 				for (int j = 0; j < pwr.num_channels; j++) {
 					if (pwr.channels[j].valid) {
-						// Voltage: [ch][LPP_VOLTAGE=116][2-byte 0.01V]
+						// Voltage: [ch][LPP_VOLTAGE=116][2-byte 0.01V signed]
 						reply[i++] = ch;
 						reply[i++] = 116;
-						uint16_t v = (uint16_t)(pwr.channels[j].voltage_v * 100);
+						int16_t v = (int16_t)(pwr.channels[j].voltage_v * 100);
 						reply[i++] = (v >> 8) & 0xFF;
 						reply[i++] = v & 0xFF;
-						// Current: [ch][LPP_CURRENT=117][2-byte 0.001A]
+						// Current: [ch][LPP_CURRENT=117][2-byte 0.001A signed]
+						// Signed: a bidirectional monitor (INA219) reports discharge
+						// as negative, and an unsigned cast saturates it to 0.
 						reply[i++] = ch;
 						reply[i++] = 117;
-						uint16_t c = (uint16_t)(pwr.channels[j].current_a * 1000);
+						int16_t c = (int16_t)(pwr.channels[j].current_a * 1000);
 						reply[i++] = (c >> 8) & 0xFF;
 						reply[i++] = c & 0xFF;
 						// Power: [ch][LPP_POWER=128][2-byte 1W]
@@ -2063,14 +2257,37 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 		_contact_iter_active = false;
 		cancelSyncPending();
 		cleanupSignState();
+		/* Drop a deferred v-contact confirm from the previous session: its ack
+		 * matches an outbound message the new session never sent, so delivering
+		 * it here would push an unmatched SEND_CONFIRMED into a fresh app. */
+		_vcontact_confirm_ack = 0;
+		k_work_cancel_delayable(&_vcontact_confirm_work.work);
 
 		/* New session: suppress v-contact notice MSG_WAITING until the initial
 		 * sync (contacts + messages) completes at PACKET_NO_MORE_MSGS. */
 		_vcontact_hold_msgwait = true;
+		/* An app-side delete only hides the v-contact for the session it
+		 * happened in — this is that session boundary, so it comes back. */
+		_vcontact_app_hidden = false;
 
 		/* If a time source already ran (hardware RTC, GPS), activate the
 		 * deferred v-contact and flush buffered notices for this session. */
 		vcontactClockSynced();
+
+		/* Re-stamp the v-contact once per app session so it stays "fresh".
+		 * _vcontact_lastmod feeds both lastmod and last_advert_timestamp, and
+		 * it used to move only on boot / rename / identity import: the app
+		 * showed an ever-growing "last seen" age, and — worse — the contact
+		 * sync gate is `_vcontact_lastmod > _contact_iter_since`, so after the
+		 * first sync the v-contact was never streamed again and app-side state
+		 * (flags, name) could never be corrected. Bumping here, before the
+		 * CMD_GET_CONTACTS that follows APP_START, means every session's sync
+		 * carries a current timestamp; deferring it to the end of sync would
+		 * always land one session late. Silent on purpose — no NEW_ADVERT push
+		 * mid-handshake; the sync itself delivers it. */
+		if (vcontactReady() && vcontactClockValid()) {
+			_vcontact_lastmod = (uint32_t)getRTCClock()->getCurrentTime();
+		}
 
 		// Return SELF_INFO
 		uint8_t rsp[90];  // 58 fixed + up to 32 bytes name
@@ -2425,16 +2642,18 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 				pub_key_prefix[3], pub_key_prefix[4], pub_key_prefix[5]);
 
 			ContactInfo *contact = lookupContactByPubKey(pub_key_prefix, 6);
-			if (contact && (txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_CLI_DATA)) {
+			if (contact && (txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_CLI_DATA ||
+					txt_type == TXT_TYPE_CLI_COMMAND)) {
 				LOG_DBG("CMD_SEND_TXT_MSG: contact='%s' text='%s' text_len=%u", contact->name, text, (unsigned)text_len);
 
 				uint32_t expected_ack = 0, est_timeout;
 				int result;
 
-				if (txt_type == TXT_TYPE_CLI_DATA) {
+				if (txt_type == TXT_TYPE_CLI_DATA || txt_type == TXT_TYPE_CLI_COMMAND) {
 					// Use node's RTC instead of app timestamp
 					msg_timestamp = getRTCClock()->getCurrentTimeUnique();
-					result = sendCommandData(*contact, msg_timestamp, attempt, text, est_timeout);
+					result = sendCommandData(*contact, msg_timestamp, attempt, txt_type, text,
+								 est_timeout);
 				} else {
 					result = sendMessage(*contact, msg_timestamp, attempt, text, expected_ack, est_timeout);
 				}
@@ -2707,7 +2926,13 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			static const uint8_t version[20] = FIRMWARE_VERSION;  // injected by CMakeLists.txt
 			uint8_t rsp[82];
 			rsp[0] = PACKET_DEVICE_INFO;
-			rsp[1] = 13;  // FIRMWARE_VER_CODE - v13 = CMD_SEND_ANON_REQ to non-contact pubkey (transient anon contacts)
+			/* v14 = CMD_RUN_CLI_COMMAND / PACKET_CLI_REPLY, plus TXT_TYPE_CLI_COMMAND
+			 * accepted by CMD_SEND_TXT_MSG and by the repeater / room-server admin
+			 * CLI.  Deliberately NOT the whole of upstream's v14: a companion here
+			 * never *executes* an over-the-air TXT_TYPE_CLI_COMMAND, so contact
+			 * flag 0x10 (remote-CLI-allowed) is stored and ignored.  See
+			 * devdocs/UPSTREAM_TRACKER.md for why. */
+			rsp[1] = 14;  // FIRMWARE_VER_CODE
 			rsp[2] = (MAX_CONTACTS / 2 > 255) ? 255 : (MAX_CONTACTS / 2);  // protocol byte, app multiplies by 2
 			rsp[3] = MAX_GROUP_CHANNELS;
 			put_le32(&rsp[4], prefs.ble_pin ? prefs.ble_pin : 123456);  // BLE PIN
@@ -2942,6 +3167,13 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 					 * and vcontactClockSynced() (the lastmod==0 path) emits at the
 					 * next time-sync instead of only after a reboot. */
 					_vcontact_lastmod = 0;
+					/* Different key → different contact in the app; the old
+					 * favourite/telemetry flags don't carry over. Persist
+					 * before the push so a reboot can't resurrect them. */
+					if (prefs.v_contact_flags != 0) {
+						prefs.v_contact_flags = 0;
+						_store->savePrefs(prefs);
+					}
 					if (vc_was_enabled) vcontactPushAdvert();
 					/* Reload contacts to invalidate ECDH shared secrets */
 					resetContacts();
@@ -2957,22 +3189,42 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 		return true;
 
 	case CMD_SEND_RAW_DATA:
-		/* Raw data packet: [cmd][path_len][path...][payload...] */
+		/* Raw data packet: [cmd][path_len][path...][payload...]
+		 *
+		 * path_len is the encoded 2-bit (hash_size - 1) + 6-bit hop count, not
+		 * a byte count, so it has to be decoded rather than added to an offset.
+		 * Treating it as a length rejected every path with a hash size above 1:
+		 * hash_size 2 sets bit 6 (path_len 0x42 for two hops read as 66 bytes,
+		 * failing the length check) and hash_size 3 sets bit 7, which used to
+		 * read back as a negative int8_t. */
 		if (len >= 6) {  /* min: cmd + path_len + 4 byte payload */
-			int i = 1;
-			int8_t path_len = (int8_t)data[i++];
-			if (path_len >= 0 && i + path_len + 4 <= (int)len) {
-				const uint8_t *path = &data[i];
-				i += path_len;
-				mesh::Packet *pkt = createRawData(&data[i], len - i);
-				if (pkt) {
-					sendDirect(pkt, path, path_len);
-					sendPacketOk();
+			size_t i = 1;
+			uint8_t path_len = data[i++];
+			if (mesh::Packet::isValidPathLen(path_len)) {
+				uint8_t path[MAX_PATH_SIZE];
+				/* Untrusted phone frame: bound the source at the bytes that
+				 * actually remain, so a crafted path_len cannot over-read. */
+				size_t path_bytes = mesh::Packet::writePath(path, &data[i], len - i, path_len);
+				if (path_bytes == 0 && (path_len & 63) != 0) {
+					/* Zero bytes written with a non-zero hop count (low 6
+					 * bits): the decoded path runs past the end of the frame. */
+					sendPacketError(ERR_ILLEGAL_ARG);
+					return true;
+				}
+				i += path_bytes;
+				if (i + 4 > len) {  /* min payload 4 bytes */
+					sendPacketError(ERR_ILLEGAL_ARG);
 				} else {
-					sendPacketError(ERR_TABLE_FULL);
+					mesh::Packet *pkt = createRawData(&data[i], len - i);
+					if (pkt) {
+						sendDirect(pkt, path, path_len);
+						sendPacketOk();
+					} else {
+						sendPacketError(ERR_TABLE_FULL);
+					}
 				}
 			} else {
-				/* Flood mode not supported (path_len < 0) */
+				/* Flood mode not supported */
 				sendPacketError(ERR_UNSUPPORTED);
 			}
 		} else {
@@ -3058,9 +3310,9 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			// Response: [PUSH_CODE_TELEMETRY_RESPONSE][reserved][6-byte pubkey][telemetry_data]
 			// Worst-case size tracks POWER_MAX_CHANNELS so a future bump can't
 			// silently overflow this stack buffer. With current value 4:
-			// header(8) + batt(4) + gps(11) + env(temp4+hum3+press4=11)
-			// + power(POWER_MAX_CHANNELS * 12 = 48) + 8 byte safety pad = 90.
-			uint8_t rsp[8 + 4 + 11 + 11 + (12 * POWER_MAX_CHANNELS) + 8];
+			// header(8) + batt(4) + gps(11) + env(temp4+hum3+press4+lum4=15)
+			// + power(POWER_MAX_CHANNELS * 12 = 48) + 8 byte safety pad = 94.
+			uint8_t rsp[8 + 4 + 11 + 15 + (12 * POWER_MAX_CHANNELS) + 8];
 			int i = 0;
 			rsp[i++] = PUSH_CODE_TELEMETRY_RESPONSE;
 			rsp[i++] = 0;  // reserved
@@ -3483,6 +3735,48 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			} else {
 				sendPacketError(ERR_TABLE_FULL);
 			}
+		} else {
+			sendPacketError(ERR_ILLEGAL_ARG);
+		}
+		return true;
+
+	case CMD_RUN_CLI_COMMAND:
+		/* Runs a CLI line on behalf of the connected app.  This is the same
+		 * local CLI the USB text sideband and the v-contact chat already reach,
+		 * over the same already-paired transport, so it adds no reach that an
+		 * app connected to this node did not already have — it is executed with
+		 * sender_timestamp 0 (local) for exactly that reason. */
+		if (len >= 2) {
+			if (_cli_exec_cb == nullptr) {
+				sendPacketError(ERR_UNSUPPORTED);
+				return true;
+			}
+
+			/* `data` is const, so the line has to be copied out to be
+			 * null-terminated.  A command can never exceed one frame. */
+			char line[MAX_FRAME_SIZE];
+			size_t cmd_len = len - 1;
+			if (cmd_len > sizeof(line) - 1) cmd_len = sizeof(line) - 1;
+			memcpy(line, &data[1], cmd_len);
+			line[cmd_len] = '\0';
+
+			/* Reply is built in place behind the frame type byte; the callback
+			 * contract requires COMPANION_CLI_REPLY_SIZE of room. */
+			uint8_t rsp[1 + COMPANION_CLI_REPLY_SIZE];
+			char *reply = (char *)&rsp[1];
+			rsp[0] = PACKET_CLI_REPLY;
+			reply[0] = '\0';
+			_cli_exec_cb(line, reply);
+			if (reply[0] == '\0') {
+				strcpy(reply, "Unknown command");
+			}
+
+			/* A CommonCLI reply can be longer than one companion frame and the
+			 * app protocol has no continuation for this response, so truncate
+			 * rather than drop. */
+			size_t rlen = strlen(reply);
+			if (rlen > MAX_FRAME_SIZE - 1) rlen = MAX_FRAME_SIZE - 1;
+			writeFrame(rsp, rlen + 1);
 		} else {
 			sendPacketError(ERR_ILLEGAL_ARG);
 		}

@@ -16,6 +16,7 @@ Supported Boards
 | XIAO nRF52840        | `west build -b xiao_nrf52840 zephcore`     | UF2 drag-drop or `west flash` |
 | ProMicro SX1262      | `west build -b promicro_sx1262 zephcore`   | UF2 drag-drop or `west flash` |
 | T1000-E              | `west build -b t1000_e zephcore`          | UF2 drag-drop or `west flash` |
+| SenseCAP MeshTracker X1 | `west build -b meshtracker_x1 zephcore` | UF2 drag-drop or `west flash` |
 | ThinkNode M1         | `west build -b thinknode_m1 zephcore`     | UF2 drag-drop or `west flash` |
 | ThinkNode M3         | `west build -b thinknode_m3 zephcore`     | UF2 drag-drop or `west flash` |
 | ThinkNode M6         | `west build -b thinknode_m6 zephcore`     | UF2 drag-drop or `west flash` |
@@ -40,6 +41,7 @@ SWD flash: `west flash` (requires J-Link, pyocd, or nrfjprog connected).
 | XIAO ESP32-C3        | `west build -b xiao_esp32c3 zephcore`                   | `west flash`    |
 | XIAO ESP32-C6        | `west build -b xiao_esp32c6/esp32c6/hpcore zephcore`    | `west flash`    |
 | LilyGo TLoRa C6      | `west build -b lilygo_tlora_c6/esp32c6/hpcore zephcore` | `west flash`    |
+| LilyGo T3S3 (SX1262) | `west build -b lilygo_t3s3/esp32s3/procpu zephcore`     | `west flash`    |
 | XIAO ESP32-S3        | `west build -b xiao_esp32s3/esp32s3/procpu zephcore`     | `west flash`    |
 | Station G2           | `west build -b station_g2/esp32s3/procpu zephcore`       | `west flash`    |
 | Heltec V3            | `west build -b heltec_wifi_lora32_v3/esp32s3/procpu zephcore` | `west flash` |
@@ -49,8 +51,16 @@ SWD flash: `west flash` (requires J-Link, pyocd, or nrfjprog connected).
 | Heltec Wireless Tracker V2 | `west build -b heltec_wireless_tracker_v2/esp32s3/procpu zephcore` | `west flash` |
 | LilyGo T-Beam v1.2     | `west build -b ttgo_tbeam/esp32/procpu zephcore`               | `west flash` |
 | ThinkNode M9           | `west build -b thinknode_m9/esp32s3/procpu zephcore`           | `west flash` |
+| Meshnology W12 (LR2021) | `west build -b meshnology_w12/esp32s3/procpu zephcore`        | `west flash` |
 
 **Heltec V3 console:** ZephCore routes console/shell to `uart0` on V3. Use the UART serial port for boot logs and CLI.
+
+**Meshnology W12:** the only board here with an LR2021 *and* an external PA, and
+the only ESP32 board whose TX power is capped well below the chip maximum —
+4 dBm at the chip is ~30 dBm at the antenna through the GC1109 front end. It has
+no USB-UART bridge, so esptool cannot auto-reset a companion build into download
+mode; use `start dfu`, a 1200-baud touch, or hold BOOT. Full port notes and the
+vendor schematic live in `devdocs/w12/`.
 
 **Heltec V4.2 vs V4.3:** The hardware revision is printed on the PCB silkscreen. If
 unclear, check GPIO2's default pull: the V4.2 GC1109 PA has an internal pull-down
@@ -96,7 +106,9 @@ for `0x1000`, since they use simple-boot in the release build too.
 
 ### SX127x Boards (loramac-node backend)
 
-ZephCore supports SX1272/SX1276/SX1278 via the loramac-node backend — a separate radio path from the native SX126x driver used by all other boards. The TTGO LoRa32 is the reference implementation:
+ZephCore can drive SX1272/SX1276/SX1278 via the loramac-node backend — a separate radio path from the native SX126x driver used by all other boards. The TTGO LoRa32 is the only board exercising it.
+
+**This path is source-only and unsupported.** No release publishes firmware for it, it is not in `build.sh` or the Mesh America catalog, and it has no RX duty cycle and no RX gain boost. Treat it as a starting point to maintain yourself, not as a supported target.
 
 | Board          | Build string                                   | Flash        |
 |----------------|------------------------------------------------|--------------|
@@ -130,9 +142,14 @@ revision.
 | Board               | Build string                                                           | Flash           |
 |----------------------|------------------------------------------------------------------------|-----------------|
 | XIAO nRF54L15        | `west build -b xiao_nrf54l15/nrf54l15/cpuapp zephcore --no-sysbuild` | `west flash`    |
+| MinewSemi ME25LS02   | `west build -b me25ls02/nrf54l15/cpuapp zephcore --no-sysbuild`      | SWD (`west flash`) |
 
 Requires J-Link or CMSIS-DAP (built into XIAO board via SAMD11 bridge).
 The `--no-sysbuild` flag is required (no MCUboot support yet).
+
+The SoC has no USB peripheral at all, so neither board has a UF2 or DFU path — `zephyr.hex`
+links at RRAM base 0x0 and is the complete image, written over SWD. On the ME25LS02's MX25LE02
+carrier the USB-C port is a CH340x UART bridge (console only), so it needs an external probe.
 
 ### MG24 (Silicon Labs)
 

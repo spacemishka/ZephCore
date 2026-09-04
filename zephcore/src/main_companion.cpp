@@ -29,8 +29,12 @@ LOG_MODULE_REGISTER(zephcore_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 #include <helpers/time_sync.h>
 #include "ui_task.h"
 #include "ui_mesh_actions.h"
+#if IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
+#include "display.h"
+#endif
 #include "oled_power.h"
 #include "led_gate.h"
+#include "buzzer_gate.h"
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_BUZZER)
 #include "buzzer.h"
 #endif
@@ -510,9 +514,9 @@ static void mesh_event_loop(void)
 
 		/* Periodic housekeeping — maintenance + UI refresh */
 		if (events & MESH_EVENT_HOUSEKEEPING) {
-			/* Radio maintenance: noise floor calibration, AGC reset,
-			 * RX watchdog.  Separated from loop() so these never run
-			 * on packet-driven events. */
+			/* Radio maintenance: noise floor calibration, adaptive-CAD
+			 * probe, RX watchdog.  Separated from loop() so these
+			 * never run on packet-driven events. */
 			if (companion_mesh_ptr) {
 				companion_mesh_ptr->maintenanceLoop();
 			}
@@ -704,7 +708,17 @@ public:
 	const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
 	const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
 	const char* getRole() override { return "companion"; }
-	bool formatFileSystem() override { return data_store.formatFileSystem(); }
+	/* CLI `erase`.  Re-stamp the init marker on success, exactly as
+	 * factoryReset() does for the BLE opcode path: the format takes
+	 * /lfs/_zc_init with it, so without this the post-reboot first-boot check
+	 * sees "no marker, no prefs" and runs a second, pointless full format. */
+	bool formatFileSystem() override {
+		bool ok = data_store.formatFileSystem();
+		if (ok) {
+			data_store.writeInitMarker();
+		}
+		return ok;
+	}
 
 	/* Advert — the companion can originate its own self-advert. delay_millis is
 	 * unused (companion sends flood at 0 ms / zero-hop immediately, matching the
@@ -716,6 +730,22 @@ public:
 	}
 	void updateAdvertTimer() override {}
 	void updateFloodAdvertTimer() override {}
+
+	/* Reboot gate — true only when the app has been told everything we owe it.
+	 * A held-back v-contact delivery-ack counts as outstanding even though it
+	 * has not reached the TX queue yet, so a `reboot` typed into the v-contact
+	 * waits for its own ack before resetting. */
+	bool transportTxIdle() override {
+		if (companion_mesh.vcontactConfirmPending()) {
+			return false;
+		}
+#if ZEPHCORE_USB_STACK
+		if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
+			return zephcore_usb_companion_tx_idle();
+		}
+#endif
+		return zephcore_ble_tx_idle();
+	}
 
 	/* Log control — no log file on companion. */
 	void setLoggingOn(bool enable) override { (void)enable; }
@@ -731,7 +761,18 @@ public:
 		return lora_radio.setRxBoost(enable);
 	}
 
+	bool setFemRxGain(bool enable) override {
+		return lora_radio.setFemRxEnable(enable);
+	}
+
+	bool configSideDetectors(const uint8_t* sfs, uint8_t num) override {
+		return lora_radio.configSideDetectors(sfs, num);
+	}
+
 	/* Adaptive CAD */
+	int formatFreqErrorStatus(char* buf, int cap) override {
+		return lora_radio.formatFreqErrorStatus(buf, cap);
+	}
 	int formatCadStatus(char* buf, int cap) override {
 		return lora_radio.formatCadStatus(buf, cap);
 	}
@@ -739,7 +780,10 @@ public:
 		lora_radio.setCadParams(companion_mesh.prefs.cad_auto != 0,
 					companion_mesh.prefs.cad_offset,
 					companion_mesh.prefs.probe_interval,
-					companion_mesh.prefs.cad_busycap);
+					companion_mesh.prefs.cad_busycap,
+					companion_mesh.prefs.cad_base);
+		companion_mesh.prefs.cad_offset = lora_radio.getCadOffset();
+		companion_mesh.prefs.cad_base = lora_radio.cadBasePeak();
 	}
 	void resetCadStats() override {
 		lora_radio.resetCadStats();
@@ -754,7 +798,21 @@ public:
 
 	void clearStats() override {
 		lora_radio.resetStats();
+		lora_radio.resetDutyCycleTimeoutRestarts();
 		companion_mesh.resetStats();
+	}
+
+	/* Duty-cycle false-preamble re-arm count.  Without these the
+	 * CommonCLICallbacks default answers 0 forever, so `get dc.restarts`
+	 * read clean on every companion regardless of what the radio was doing
+	 * — and the companion is the role the duty cycle actually runs in.
+	 * Mirrors RepeaterMesh::getDutyCycleTimeoutRestarts(). */
+	uint32_t getDutyCycleTimeoutRestarts() const override {
+		return lora_radio.getDutyCycleTimeoutRestarts();
+	}
+
+	void resetDutyCycleTimeoutRestarts() override {
+		lora_radio.resetDutyCycleTimeoutRestarts();
 	}
 
 	/* Temp radio params — deferred; stub for now. */
@@ -949,6 +1007,9 @@ static bool handle_vcontact_cli(const char *line, char *reply)
 			companion_mesh.vcontactPushAdvert();
 		} else if (!en && was) {
 			companion_mesh.vcontactPushDeleted();
+			/* The app drops the contact, so its flags (favourite / telemetry
+			 * permissions) go with it — same as the app-side delete path. */
+			companion_mesh.prefs.v_contact_flags = 0;
 		}
 		snprintf(reply, CLI_REPLY_SIZE, "OK - v.contact %s", en ? "on" : "off");
 		return true;
@@ -1032,9 +1093,9 @@ static bool companion_shutdown_hook(int reason)
 /* Transport-neutral CLI line execution — runs on the MAIN thread only
  * (CommonCLI::handleCommand touches mesh state shared with loop()). Both the
  * USB text sideband and the v-contact chat funnel through here. `reply` must
- * be CLI_REPLY_SIZE (== VCONTACT_CLI_REPLY_SIZE). */
-static_assert(VCONTACT_CLI_REPLY_SIZE == CLI_REPLY_SIZE,
-	      "v-contact reply buffer must match CommonCLI reply size");
+ * be CLI_REPLY_SIZE (== COMPANION_CLI_REPLY_SIZE). */
+static_assert(COMPANION_CLI_REPLY_SIZE == CLI_REPLY_SIZE,
+	      "companion CLI reply buffer must match CommonCLI reply size");
 
 static void companion_cli_exec(const char *line, char *reply)
 {
@@ -1388,8 +1449,12 @@ int main(void)
 	 * loadPrefs then keeps that 0 instead of the real default (this is what
 	 * zeroed probe_interval / cad_auto and, earlier, the GPS settings). */
 	initNodePrefs(&companion_mesh.prefs);
-	/* Companion-specific overrides vs. initNodePrefs defaults: */
-	companion_mesh.prefs.auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS; /* low-batt cutoff (0=off) */
+	/* Companion-specific overrides vs. initNodePrefs defaults.  auto_shutdown_mv
+	 * used to be set here too; it now comes from initNodePrefs() itself, which
+	 * is what the comment above asks for — a value listed only here is invisible
+	 * to every other caller of initNodePrefs(). gps_interval stays because
+	 * initNodePrefs() hardcodes the 300 s companion figure while repeaters run a
+	 * much longer duty; this line is how a board's Kconfig value wins. */
 	companion_mesh.prefs.gps_interval = CONFIG_ZEPHCORE_GPS_POLL_INTERVAL_SEC; /* 5-min duty cycle (0=always-on) */
 
 	/* Load prefs from storage */
@@ -1452,7 +1517,7 @@ int main(void)
 		zephcore_ble_set_passkey(new_pin);
 	});
 	/* V-contact chat lines run the same CLI as the USB text sideband. */
-	companion_mesh.setVContactCLICallback(companion_cli_exec);
+	companion_mesh.setCLICallback(companion_cli_exec);
 	companion_mesh_ptr = &companion_mesh;
 
 	/* Set LoRa callbacks for event-driven packet processing */
@@ -1476,6 +1541,17 @@ int main(void)
 	if (boot_cause_msg[0] != '\0') {
 		companion_mesh.vcontactNotify(boot_cause_msg);
 	}
+
+	/* Physical mounting orientation, from prefs.  This is the earliest it can
+	 * run — ui_init() brings the panel up before prefs are loaded, so the
+	 * splash may flash upright for a moment before the remap lands.  A panel
+	 * that cannot rotate logs a warning and stays native. */
+	zephcore_input_set_flipped(companion_mesh.prefs.input_rotate != 0);
+#if IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
+	if (companion_mesh.prefs.display_rotate) {
+		mc_display_set_rotated(true);
+	}
+#endif
 
 	/* Push initial state to UI display */
 	ui_set_node_name(companion_mesh.prefs.node_name);
@@ -1506,15 +1582,16 @@ int main(void)
 	LOG_INF("offgrid mode: %s (from prefs)",
 		companion_mesh.prefs.client_repeat ? "on" : "off");
 
-	/* Restore buzzer mute state from persisted prefs, then play
-	 * startup chime only if buzzer is not muted.
-	 * buzzer_init() defaults to quiet=true, so we must always
-	 * call buzzer_set_quiet() to apply the saved preference. */
+	/* Restore the notification mode from persisted prefs, then play the
+	 * startup chime only if sound is on. buzzer_init() defaults to
+	 * quiet=true, so the saved preference must always be applied. */
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_BUZZER)
-	buzzer_set_quiet(companion_mesh.prefs.buzzer_quiet);
-	ui_set_buzzer_quiet(companion_mesh.prefs.buzzer_quiet);
-	LOG_INF("buzzer: quiet=%s (from prefs)",
-		companion_mesh.prefs.buzzer_quiet ? "true" : "false");
+	{
+		uint8_t bmode = zephcore_buzzer_mode_from_prefs(companion_mesh.prefs.buzzer_quiet);
+		zephcore_buzzer_set_mode(bmode, false);
+		ui_set_buzzer_mode(bmode);
+		LOG_INF("buzzer: mode=%u (from prefs)", bmode);
+	}
 	ui_play_startup_chime();
 #endif
 
@@ -1524,6 +1601,8 @@ int main(void)
 	 * LED and is linked into every build, UI or not. */
 	bool leds_off = companion_mesh.prefs.leds_disabled != 0;
 	zephcore_leds_set_disabled(leds_off);
+	zephcore_leds_set_radio_mode(companion_mesh.prefs.leds_radio_mode);
+	zephcore_leds_set_hb_mode(companion_mesh.prefs.leds_hb_mode);
 	ui_set_heartbeat_led(!leds_off);
 	LOG_INF("LEDs: %s (from prefs)", leds_off ? "disabled" : "enabled");
 
@@ -1547,11 +1626,35 @@ int main(void)
 
 	/* Apply RX boost and duty cycle from prefs */
 	lora_radio.setRxBoost(companion_mesh.prefs.rx_boost != 0);
+	lora_radio.setFemRxEnable(companion_mesh.prefs.fem_rxgain != 0);
 	lora_radio.enableRxDutyCycle(companion_mesh.prefs.rx_duty_cycle != 0);
 	lora_radio.setCadParams(companion_mesh.prefs.cad_auto != 0,
 				companion_mesh.prefs.cad_offset,
 				companion_mesh.prefs.probe_interval,
-				companion_mesh.prefs.cad_busycap);
+				companion_mesh.prefs.cad_busycap,
+				companion_mesh.prefs.cad_base);
+	/* Write back the (offset, base) actually in force.  setCadParams() may
+	 * have re-anchored the offset across a base-table change, and the pair
+	 * has to be persisted for the NEXT upgrade to have an anchor of its own.
+	 * Guarded so a node whose base has not moved never writes flash at boot. */
+	if (companion_mesh.prefs.cad_base != lora_radio.cadBasePeak() ||
+	    companion_mesh.prefs.cad_offset != lora_radio.getCadOffset()) {
+		companion_mesh.prefs.cad_offset = lora_radio.getCadOffset();
+		companion_mesh.prefs.cad_base = lora_radio.cadBasePeak();
+		data_store.savePrefs(companion_mesh.prefs);
+	}
+
+	/* LR2021 side detectors (multi-SF RX) from prefs.  extra_sf is a
+	 * zero-terminated list; a rejected set (SF/BW changed since it was
+	 * saved) just leaves the feature off, and non-LR2021 radios report it
+	 * unsupported. */
+	{
+		uint8_t n = 0;
+		while (n < EXTRA_SF_MAX && companion_mesh.prefs.extra_sf[n] != 0) n++;
+		if (n > 0 && !lora_radio.configSideDetectors(companion_mesh.prefs.extra_sf, n)) {
+			LOG_WRN("extra.sf %u SFs rejected for current SF/BW — side detectors off", n);
+		}
+	}
 	ui_set_radio_runtime(
 		lora_radio.getActiveSyncWord(),
 		lora_radio.getActivePreambleLength(),

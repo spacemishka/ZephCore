@@ -3,8 +3,8 @@
  * SX126x native driver — extension API
  *
  * Functions extending the standard Zephyr lora_driver_api with
- * SX126x-specific features (duty cycle, RX boost, RSSI readout,
- * preamble detection).
+ * SX126x-specific features (duty cycle, RX boost, external FEM gating,
+ * RSSI readout, preamble detection).
  */
 
 #ifndef SX126X_EXT_H
@@ -49,6 +49,32 @@ bool sx126x_is_receiving(const struct device *dev);
  * @param enable true to enable boost
  */
 void sx126x_set_rx_boost(const struct device *dev, bool enable);
+
+/**
+ * @brief Select an external FEM's LNA or its bypass path for RX
+ *
+ * Acts on lna-bypass-gpios, the FEM's receive-path select -- KCT8103L CTX on
+ * the Heltec boards, where DIO2 into the FEM's CPS pin does the TX/RX
+ * switching and leaves this line meaning nothing but "LNA or bypass".
+ * Passing false routes RX around the LNA: its gain (~17 dB measured) and its
+ * supply current both drop out, but the antenna stays connected to the
+ * receiver.  TX and the driver's idle/sleep gating are unaffected.
+ *
+ * This is deliberately NOT antenna-enable-gpios.  That line is the FEM's chip
+ * enable, owned by the RX/TX/sleep state machine; deasserting it during RX
+ * shuts the part down, and a shut-down FEM passes nothing -- the node goes
+ * deaf by tens of dB rather than losing the LNA's share.  ZephCore 1.17.2
+ * shipped that mistake; see the KCT8103L handling in MeshCore's
+ * variants/heltec_v4/LoRaFEMControl.cpp for the reference behaviour.
+ *
+ * Default is enabled (LNA in the path).
+ *
+ * @param dev    LoRa device
+ * @param enable true for the LNA path, false for the bypass path
+ * @return true if this board wires a receive-path select, false if it has
+ *         none (in which case the call did nothing)
+ */
+bool sx126x_set_fem_rx_enable(const struct device *dev, bool enable);
 
 /**
  * @brief Check if the radio chip is busy (cannot accept SPI commands)
@@ -136,25 +162,71 @@ void sx126x_reset_dc_timeout_restarts(const struct device *dev);
 void sx126x_cad_set_peak_offset(const struct device *dev, int8_t offset);
 
 /**
- * @brief Per-SF base cadDetPeak for the currently configured SF
+ * @brief Base cadDetPeak for the current SF, bandwidth and CAD symbol count
  *
  * @param dev LoRa device
- * @return Base detPeak (SF + 13 on this family)
+ * @return Base detPeak (roughly 18-34 on this family)
  */
 uint8_t sx126x_cad_base_peak(const struct device *dev);
 
 /**
+ * @brief Lowest detPeak this driver will program.
+ *
+ * The C++ adaptive-CAD controller narrows its offset window to this range so it
+ * never explores offsets that collapse onto one peak.
+ *
+ * @return Minimum absolute detPeak
+ */
+uint8_t sx126x_cad_peak_min(void);
+
+/**
+ * @brief Highest detPeak this driver will program.
+ *
+ * @return Maximum absolute detPeak
+ */
+uint8_t sx126x_cad_peak_max(void);
+
+/**
  * @brief Run one blocking calibration CAD at base detPeak + peak_offset
  *
- * Uses the operating modem config (SF/BW/symbol count).  Leaves the chip
- * in STANDBY — the caller must restart RX afterwards.  Must be called
- * from the mesh loop thread only (same thread as the LBT CAD).
+ * Uses the operating modem config (SF/BW/symbol count).  Armed with the
+ * CAD_RX exit mode, so the two verdicts leave the chip in different places:
+ * a NEGATIVE CAD exits to standby and the caller must restart RX, while a
+ * POSITIVE one leaves the chip in Rx on the signal it detected and the caller
+ * must NOT.  The return value distinguishes them.  Must be called from the
+ * mesh loop thread only (same thread as the LBT CAD).
  *
  * @param dev         LoRa device
  * @param peak_offset Signed offset from the base table value
- * @return 1 = activity detected, 0 = channel free, <0 = error
+ * @return 2 = activity detected, chip left in Rx (see sx126x_cad_rx_outcome())
+ *         0 = channel free, chip in standby, caller restarts RX
+ *         <0 = error
  */
 int sx126x_cad_probe(const struct device *dev, int8_t peak_offset);
+
+/**
+ * @brief Outcome of the Rx a positive sx126x_cad_probe() entered
+ *
+ * The chip always resolves that Rx with a terminal interrupt -- a packet, or
+ * RX_TX_TIMEOUT at cadTimeout -- so this reports an observed event rather than
+ * an inference, and never has to be polled in a loop.  Call it once after the
+ * cadTimeout deadline has passed; it consumes the result.
+ *
+ * @param dev LoRa device
+ * @return 1 = a packet completed (RX_DONE or CRC_ERR): the detection was real
+ *         2 = cadTimeout expired with nothing decoded: no packet followed
+ *         0 = nothing armed, or the terminal interrupt has not arrived yet
+ */
+int sx126x_cad_rx_outcome(const struct device *dev);
+
+/**
+ * @brief The cadTimeout a CAD_RX probe programs, in milliseconds
+ *
+ * Max-length-packet airtime at the current SF/BW.  Exposed so a caller waiting
+ * to read sx126x_cad_rx_outcome() uses the chip's own deadline rather than a
+ * guess of its own.
+ */
+uint32_t sx126x_cad_rx_timeout_ms(const struct device *dev);
 
 #ifdef __cplusplus
 }

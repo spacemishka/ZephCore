@@ -11,6 +11,8 @@
  */
 
 #include <zephyr/kernel.h>
+
+#include <helpers/buzzer_gate.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/regulator.h>
@@ -44,6 +46,8 @@ LOG_MODULE_REGISTER(zephcore_ui_actions, CONFIG_ZEPHCORE_UI_ACTIONS_LOG_LEVEL);
 #define UI_ACTION_SCREEN_OFF_SAVE   BIT(10)
 #define UI_ACTION_PATH_HASH_MODE_SAVE BIT(11)
 #define UI_ACTION_GPS_DUTY_SAVE     BIT(12)
+#define UI_ACTION_DISPLAY_ROTATE_SAVE BIT(13)
+#define UI_ACTION_INPUT_ROTATE_SAVE BIT(14)
 
 /* Module-local pointers, set by init */
 static CompanionMesh *s_mesh;
@@ -61,7 +65,7 @@ static atomic_t pending_ui_actions;
  * Written before atomic_or on pending_ui_actions, read after atomic_clear,
  * so the atomic provides ordering. Using atomic_t for portability. */
 static atomic_t pending_gps_enabled;
-static atomic_t pending_buzzer_quiet;
+static atomic_t pending_buzzer_mode;
 static atomic_t pending_offgrid_enabled;
 static atomic_t pending_leds_disabled;
 static atomic_t pending_ble_disabled;
@@ -70,6 +74,8 @@ static atomic_t pending_wake_on_msg;
 static atomic_t pending_screen_off_secs;
 static atomic_t pending_path_hash_mode;
 static atomic_t pending_gps_duty_sec;
+static atomic_t pending_display_rotate;
+static atomic_t pending_input_rotate;
 
 extern "C" void ui_mesh_actions_init(struct k_event *mesh_events,
 				     uint32_t mesh_event_ui_action,
@@ -146,6 +152,20 @@ extern "C" void mesh_save_screen_off_secs(uint16_t secs)
 	k_event_post(s_mesh_events, s_mesh_event_ui_action);
 }
 
+extern "C" void mesh_save_display_rotate(bool rotated)
+{
+	atomic_set(&pending_display_rotate, rotated ? 1 : 0);
+	atomic_or(&pending_ui_actions, UI_ACTION_DISPLAY_ROTATE_SAVE);
+	k_event_post(s_mesh_events, s_mesh_event_ui_action);
+}
+
+extern "C" void mesh_save_input_rotate(bool rotated)
+{
+	atomic_set(&pending_input_rotate, rotated ? 1 : 0);
+	atomic_or(&pending_ui_actions, UI_ACTION_INPUT_ROTATE_SAVE);
+	k_event_post(s_mesh_events, s_mesh_event_ui_action);
+}
+
 extern "C" void mesh_save_path_hash_mode(uint8_t mode)
 {
 	atomic_set(&pending_path_hash_mode, (atomic_val_t)mode);
@@ -164,10 +184,10 @@ extern "C" void mesh_save_gps_duty_sec(uint32_t sec)
 	k_event_post(s_mesh_events, s_mesh_event_ui_action);
 }
 
-extern "C" void mesh_set_buzzer_quiet(bool quiet)
+extern "C" void mesh_set_buzzer_mode(uint8_t mode)
 {
 	/* Defer the flash write (savePrefs) to mesh thread */
-	atomic_set(&pending_buzzer_quiet, quiet ? 1 : 0);
+	atomic_set(&pending_buzzer_mode, (atomic_val_t)mode);
 	atomic_or(&pending_ui_actions, UI_ACTION_BUZZER_TOGGLE);
 	k_event_post(s_mesh_events, s_mesh_event_ui_action);
 }
@@ -248,9 +268,9 @@ extern "C" void mesh_handle_ui_actions(void)
 	}
 
 	if (actions & UI_ACTION_BUZZER_TOGGLE) {
-		bool bq = atomic_get(&pending_buzzer_quiet) != 0;
-		s_mesh->prefs.buzzer_quiet = bq ? 1 : 0;
-		LOG_INF("buzzer_quiet=%d (button)", bq);
+		uint8_t mode = (uint8_t)atomic_get(&pending_buzzer_mode);
+		s_mesh->prefs.buzzer_quiet = zephcore_buzzer_prefs_from_mode(mode);
+		LOG_INF("buzzer mode=%u (button)", mode);
 		need_save = true;
 	}
 
@@ -294,6 +314,18 @@ extern "C" void mesh_handle_ui_actions(void)
 		need_save = true;
 	}
 
+	if (actions & UI_ACTION_DISPLAY_ROTATE_SAVE) {
+		s_mesh->prefs.display_rotate = atomic_get(&pending_display_rotate) ? 1 : 0;
+		LOG_INF("display_rotate=%d (button)", s_mesh->prefs.display_rotate);
+		need_save = true;
+	}
+
+	if (actions & UI_ACTION_INPUT_ROTATE_SAVE) {
+		s_mesh->prefs.input_rotate = atomic_get(&pending_input_rotate) ? 1 : 0;
+		LOG_INF("input_rotate=%d (button)", s_mesh->prefs.input_rotate);
+		need_save = true;
+	}
+
 	if (actions & UI_ACTION_PATH_HASH_MODE_SAVE) {
 		uint8_t mode = (uint8_t)atomic_get(&pending_path_hash_mode);
 		if (mode > 2) mode = 2;  /* clamp to valid range (0-2 → 1-3 bytes) */
@@ -330,8 +362,11 @@ extern "C" void mesh_housekeeping_ui_refresh(void)
 	/* Battery is now refreshed lazily from ui_pages_render() with a 30 s
 	 * freshness guard — no periodic ADC fire here. */
 
-	/* Update top bar clock from RTC */
+	/* Update top bar clock from RTC.  The epoch pushed here is UTC; the
+	 * display offset is a separate push so nothing downstream is tempted to
+	 * bake a timezone into a timestamp (see NodePrefs::tz_offset). */
 	ui_set_clock(s_rtc_clock->getCurrentTime());
+	ui_set_tz(s_mesh->prefs.tz_offset);
 
 	ui_set_radio_params(
 		s_lora_radio->getActiveFrequencyHz(),

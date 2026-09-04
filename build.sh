@@ -11,6 +11,7 @@ nRF_boards=(
     wio_tracker_l1
     wio_tracker_l1_epaper
     t1000_e
+    meshtracker_x1
     thinknode_m1
     thinknode_m3
     thinknode_m6
@@ -35,17 +36,42 @@ Linux_boards=(
     rak6421_pi5
 )
 
+# nRF54L15 boards. No bootloader exists for this SoC (it has no USB
+# peripheral at all), so these build with --no-sysbuild and the app links at
+# RRAM base 0x0 -- zephyr.hex IS the whole image. Flashing is SWD only, which
+# is why they publish a .hex and no .uf2/.zip, and why they are download-only
+# in the Mesh America catalog.
+nRF54L_boards=(
+    me25ls02/nrf54l15/cpuapp
+    xiao_nrf54l15/nrf54l15/cpuapp
+)
+
+# SWD-only ARM platforms. Neither SoC has a USB device peripheral, so there is
+# no bootloader, no UF2 and no DFU path -- zephyr.hex links at the flash origin
+# and IS the whole image, written with an external probe. Same story as the
+# nRF54L boards above, which is why they publish a .hex and nothing else and are
+# download-only in the Mesh America catalog.
+MG24_boards=(
+    xiao_mg24
+)
+
+STM32WL_boards=(
+    lora_e5_mini
+)
+
 ESP32_boards=(
     xiao_esp32c3
     xiao_esp32c6/esp32c6/hpcore
     xiao_esp32s3/esp32s3/procpu
     lilygo_tlora_c6/esp32c6/hpcore
+    lilygo_t3s3/esp32s3/procpu
     station_g2/esp32s3/procpu
     heltec_wifi_lora32_v3/esp32s3/procpu
     heltec_wifi_lora32_v4/esp32s3/procpu
     heltec_wifi_lora32_v43/esp32s3/procpu
     heltec_wireless_tracker/esp32s3/procpu
     heltec_wireless_tracker_v2/esp32s3/procpu
+    meshnology_w12/esp32s3/procpu
     ttgo_tbeam/esp32/procpu
 )
 
@@ -103,6 +129,63 @@ if [[ $1 == "nrf" ]]; then
                 echo "NOTE: $f not present — erase package for SoftDevice v${sd} will 404"
             fi
         done
+    done
+
+    # Device art we ship ourselves (see `own_img` in gen_provider_catalog.py).
+    # Published alongside the firmware so the catalog resolves it against the
+    # same --url-base as everything else, rather than hardcoding a host.
+    if compgen -G "img/*" > /dev/null; then
+        cp img/* firmware/
+        echo "Published device art: $(ls img/ | tr '\n' ' ')"
+    fi
+fi
+
+if [[ $1 == "nrf54l" ]]; then
+    for board in "${nRF54L_boards[@]}"; do
+        board_clean_for_path=$(echo "$board" | sed -e 's/\//-/g')
+
+        echo "Now building $board companion"
+        west build -b "$board" zephcore --pristine --no-sysbuild
+        mv build/zephyr/zephyr.hex firmware/"$board_clean_for_path"-companion-"$COMMIT_HASH".hex
+
+        echo "Now building $board repeater"
+        west build -b "$board" zephcore --pristine --no-sysbuild -- -DEXTRA_CONF_FILE="boards/common/repeater.conf"
+        mv build/zephyr/zephyr.hex firmware/"$board_clean_for_path"-repeater-"$COMMIT_HASH".hex
+    done
+fi
+
+# Silicon Labs EFR32MG24. Needs the Silabs BLE controller blob (west blobs fetch
+# hal_silabs) before the first build -- CI fetches it in the build-swd job.
+# Flashed over SWD with pyocd/J-Link; the XIAO's USB-C is a debug bridge, not a
+# device port, so there is no browser-flashable path.
+if [[ $1 == "mg24" ]]; then
+    for board in "${MG24_boards[@]}"; do
+        board_clean_for_path=$(echo "$board" | sed -e 's/\//-/g')
+
+        echo "Now building $board companion"
+        west build -b "$board" zephcore --pristine
+        mv build/zephyr/zephyr.hex firmware/"$board_clean_for_path"-companion-"$COMMIT_HASH".hex
+
+        echo "Now building $board repeater"
+        west build -b "$board" zephcore --pristine -- -DEXTRA_CONF_FILE="boards/common/repeater.conf"
+        mv build/zephyr/zephyr.hex firmware/"$board_clean_for_path"-repeater-"$COMMIT_HASH".hex
+    done
+fi
+
+# STM32WL. No Bluetooth and no USB device: the companion speaks MeshCore serial
+# framing over USART1 (bridged to USB-C by the onboard USB-UART chip) and the
+# repeater uses the same UART for its CLI. Flashed over SWD/ST-Link.
+if [[ $1 == "stm32wl" ]]; then
+    for board in "${STM32WL_boards[@]}"; do
+        board_clean_for_path=$(echo "$board" | sed -e 's/\//-/g')
+
+        echo "Now building $board companion"
+        west build -b "$board" zephcore --pristine
+        mv build/zephyr/zephyr.hex firmware/"$board_clean_for_path"-companion-"$COMMIT_HASH".hex
+
+        echo "Now building $board repeater"
+        west build -b "$board" zephcore --pristine -- -DEXTRA_CONF_FILE="boards/common/repeater.conf"
+        mv build/zephyr/zephyr.hex firmware/"$board_clean_for_path"-repeater-"$COMMIT_HASH".hex
     done
 fi
 
@@ -191,6 +274,16 @@ if [[ $1 == "esp32" ]]; then
 
         if [[ $2 == "companions" ]]; then
             # build ESP32 companions (production is the default)
+            #
+            # The USB CDC-ACM companion transport (boards/common/esp32s3_usb.conf)
+            # is NOT selected here. zephcore/CMakeLists.txt auto-includes it for
+            # companion builds on every S3 board whose board.overlay declares the
+            # USB OTG CDC-ACM node, so a plain build below already gets it — and a
+            # developer building the same board by hand gets identical firmware.
+            # Keeping the choice in one place is the point: release artifacts
+            # already diverge from a plain build in layout (sysbuild/MCUboot), and
+            # a second divergence in which transports the app speaks would make
+            # user bug reports unreproducible from source.
             echo "Now building $board companion"
             west build -b "$board" zephcore --pristine --sysbuild
             FLASH_SIZE=$(

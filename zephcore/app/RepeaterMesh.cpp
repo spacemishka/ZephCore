@@ -161,11 +161,27 @@ uint8_t RepeaterMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t
                                                           guest_pw,
                                                           sizeof(received));
 
-        /* An empty stored guest password disables guest access (as
-         * CONFIG_ZEPHCORE_GUEST_PASSWORD documents) rather than matching an
-         * empty submitted password and letting anyone in. Both compares above
-         * still run unconditionally, so timing is unchanged. */
-        if (_prefs.guest_password[0] == 0) guest_match = false;
+        /* An empty stored guest password means OPEN GUEST ACCESS on a repeater,
+         * deliberately, matching Arduino MeshCore: its NodePrefs default is
+         * guest_password[0] = 0 (src/helpers/CommonCLI.h) and
+         * examples/simple_repeater/MyMesh.cpp compares with a plain strcmp, so a
+         * blank submitted password logs in as guest. Only a blank submission
+         * matches -- a wrong non-blank password still fails, because both
+         * buffers are zero-padded and compared full-width.
+         *
+         * This is deliberately NOT what RoomServerMesh.cpp does, and the two
+         * must not be "made consistent". There an empty guest password disables
+         * guest access, because on a room server that password is what gates
+         * posting and an accidentally open room is a real hole (the 2026-07-30
+         * finding: every ZephCore room server shipped open). Arduino closes the
+         * same hole from the other side, by defaulting the room server's
+         * guest_password to ROOM_PASSWORD rather than leaving it empty.
+         *
+         * The blast radius on a repeater is small by construction:
+         * PERM_ACL_GUEST cannot run CLI commands -- the PAYLOAD_TYPE_TXT_MSG
+         * path in onPeerDataRecv() requires isAdmin() -- and cannot read the
+         * access list (REQ_TYPE_GET_ACCESS_LIST likewise). A guest gets login
+         * plus status/telemetry. Set a guest password to close it. */
 
         if (admin_match) {
             perms = PERM_ACL_ADMIN;
@@ -192,12 +208,34 @@ uint8_t RepeaterMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t
         LOG_INF("Login success");
         client->last_timestamp = sender_timestamp;
         client->last_activity = getRTCClock()->getCurrentTime();
-        client->permissions &= ~0x03;
-        client->permissions |= perms;
+        /* Role assignment only ever escalates. putClient() hands back the
+         * existing entry for a known pubkey, so writing the role bits
+         * unconditionally lets a later guest login on a key that already holds
+         * admin silently strip those rights — the operator is then locked out
+         * of their own repeater with no way back in over the air. Revoking
+         * admin is a deliberate act and belongs to the CLI. */
+        if (!client->isAdmin()) {
+            client->permissions &= ~0x03;
+            client->permissions |= perms;
+        }
         memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
 
-        if (perms != PERM_ACL_GUEST) {
-            if (!dirty_contacts_expiry) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+        if (client->isAdmin()) {
+            /* Flush admin sessions now instead of leaving them on the lazy
+             * timer. The entry carries the shared secret this session's
+             * traffic is encrypted with; if power is lost before the timer
+             * fires, the client keeps a secret the repeater no longer knows
+             * and every later request decrypts to nothing, which presents as
+             * a wrong password or an unreachable node. A repeater is the
+             * device most likely to lose power unattended, so the few
+             * milliseconds are worth it. save() writes the whole ACL, so any
+             * other pending changes go out with it. */
+            if (_store) {
+                acl.save(_store->getAclPath());
+                dirty_contacts_expiry = 0;
+            } else if (!dirty_contacts_expiry) {
+                dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+            }
         }
     }
 
@@ -352,6 +390,9 @@ int RepeaterMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp, u
             }
             if (env.has_pressure) {
                 lpp.addBarometricPressure(CH_SELF, env.pressure_hpa);
+            }
+            if (env.has_luminosity) {
+                lpp.addLuminosity(CH_SELF, env.luminosity);
             }
         } else {
             /* No env sensors at all — try MCU temp directly */
@@ -541,26 +582,32 @@ void RepeaterMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt,
 }
 
 void RepeaterMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size) {
-    if (recv_pkt_region && !recv_pkt_region->isWildcard()) {  // if _request_ packet scope is known, send reply with same scope
-        TransportKey scope;
-        if (region_map.getTransportKeysFor(*recv_pkt_region, &scope, 1) > 0) {
-            sendFloodScoped(scope, packet, delay_millis, path_hash_size);
-        } else {
-            sendFlood(packet, delay_millis, path_hash_size);  // send un-scoped
-        }
-    } else {
+    TransportKey req_scope;
+    bool req_scope_known = recv_pkt_region != nullptr && !recv_pkt_region->isWildcard()
+                        && region_map.getTransportKeysFor(*recv_pkt_region, &req_scope, 1) > 0;
+
+    switch (mesh::chooseReplyScope(req_scope_known, recv_pkt_unscoped_flood, !default_scope.isNull())) {
+    case mesh::REPLY_SCOPE_REQUEST:
+        sendFloodScoped(req_scope, packet, delay_millis, path_hash_size);  // same scope as the request
+        break;
+    case mesh::REPLY_SCOPE_DEFAULT:
+        // requester's scope is unknown: a DIRECT request (no transport codes), or a
+        // code that matched no Region. Un-scoped would be dropped at hop 0 by every
+        // repeater running flood.max.unscoped=0.
+        sendFloodScoped(default_scope, packet, delay_millis, path_hash_size);
+        break;
+    case mesh::REPLY_SCOPE_NONE:
         sendFlood(packet, delay_millis, path_hash_size);  // send un-scoped
+        break;
     }
 }
 
 bool RepeaterMesh::allowPacketForward(const mesh::Packet* packet) {
     if (_prefs.disable_fwd) return false;
-    if (packet->isRouteFlood()) {
-        if (packet->getPathHashCount() >= _prefs.flood_max) return false;
-        // un-scoped floods can be clamped to a lower hop limit than scoped (transport) floods
-        if (packet->getRouteType() == ROUTE_TYPE_FLOOD && packet->getPathHashCount() >= _prefs.flood_max_unscoped) return false;
-        // ADVERT floods get their own (typically tighter) hop ceiling to curb advert churn
-        if (packet->getPayloadType() == PAYLOAD_TYPE_ADVERT && packet->getPathHashCount() >= _prefs.flood_max_advert) return false;
+    if (packet->isRouteFlood()
+        && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped,
+                                         _prefs.flood_max_advert)) {
+        return false;
     }
     if (packet->isRouteFlood() && recv_pkt_region == nullptr) return false;
     if (packet->isRouteFlood() && _prefs.loop_detect != LOOP_DETECT_OFF) {
@@ -654,6 +701,7 @@ mesh::DispatcherAction RepeaterMesh::onRecvPacket(mesh::Packet* pkt) {
     // Determine the request packet's region so sendFloodReply() can echo the same
     // scope. Runs for every packet (not just floods) so recv_pkt_region is cleared
     // for direct packets instead of inheriting the last flood's region.
+    recv_pkt_unscoped_flood = (pkt->getRouteType() == ROUTE_TYPE_FLOOD);
     if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
         recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
     } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
@@ -691,16 +739,37 @@ void RepeaterMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, c
 
         if (reply_len == 0) return;
 
-        if (packet->isRouteFlood()) {
+        /* A DIRECT request that supplied no reply path can still be answered
+         * along the out_path already stored for this client, as
+         * onPeerDataRecv() does for REQ. Flooding it instead is both wasteful
+         * and — under flood.max.unscoped=0 — silently undeliverable. */
+        ClientInfo* client = acl.getClient(sender.pub_key, PUB_KEY_SIZE);
+        bool have_out_path = client != nullptr && client->out_path_len != OUT_PATH_UNKNOWN;
+
+        switch (mesh::chooseReplyRoute(packet->isRouteFlood(),
+                                       reply_path_len != OUT_PATH_UNKNOWN, have_out_path)) {
+        case mesh::REPLY_ROUTE_PATH_RETURN: {
+            // let this sender know the path TO here, so they can use sendDirect() later
             mesh::Packet* path = createPathReturn(sender, secret, packet->path, packet->path_len,
                                                   PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
             if (path) sendFloodReply(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
-        } else if (reply_path_len == OUT_PATH_UNKNOWN) {
-            mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
-            if (reply) sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
-        } else {
+            break;
+        }
+        case mesh::REPLY_ROUTE_DIRECT_SUPPLIED: {
             mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
             if (reply) sendDirect(reply, reply_path, reply_path_len, SERVER_RESPONSE_DELAY);
+            break;
+        }
+        case mesh::REPLY_ROUTE_DIRECT_OUT_PATH: {
+            mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
+            if (reply) sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
+            break;
+        }
+        case mesh::REPLY_ROUTE_FLOOD: {
+            mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
+            if (reply) sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+            break;
+        }
         }
     }
 }
@@ -791,7 +860,11 @@ void RepeaterMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender
         memcpy(&sender_timestamp, data, 4);
         uint8_t flags = (data[4] >> 2);
 
-        if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA)) {
+        /* TXT_TYPE_CLI_COMMAND (v1.18+) is handled exactly like TXT_TYPE_CLI_DATA
+         * here: both reach this block only behind client->isAdmin(), and both
+         * are covered by the monotonic sender_timestamp / is_retry gates below. */
+        if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA ||
+              flags == TXT_TYPE_CLI_COMMAND)) {
             LOG_DBG("onPeerDataRecv: unsupported text type: flags=%02x", flags);
         } else if (sender_timestamp >= client->last_timestamp) {
             bool is_retry = (sender_timestamp == client->last_timestamp);
@@ -947,6 +1020,7 @@ RepeaterMesh::RepeaterMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Mil
     _logging = false;
     region_load_active = false;
     recv_pkt_region = nullptr;
+    recv_pkt_unscoped_flood = false;
     memset(default_scope.key, 0, sizeof(default_scope.key));
     pending_discover_tag = 0;
     pending_discover_until = 0;
@@ -1102,6 +1176,9 @@ void RepeaterMesh::formatGpsStatsReply(char* reply) {
             "on state=%s sats=%u no fix",
             state, gsi.satellites);
     }
+
+    /* Per-constellation tally is deliberately NOT appended here — "get gps"
+     * has to fit a LoRa reply. It lives in "get gps diag" instead. */
 }
 
 void RepeaterMesh::savePrefs() {
@@ -1178,6 +1255,14 @@ void RepeaterMesh::setTxPower(int8_t power_dbm) {
 
 bool RepeaterMesh::setRxBoostedGain(bool enable) {
     return getRadioDriver(_radio).setRxBoost(enable);
+}
+
+bool RepeaterMesh::setFemRxGain(bool enable) {
+    return getRadioDriver(_radio).setFemRxEnable(enable);
+}
+
+bool RepeaterMesh::configSideDetectors(const uint8_t* sfs, uint8_t num) {
+    return getRadioDriver(_radio).configSideDetectors(sfs, num);
 }
 
 void RepeaterMesh::formatNeighborsReply(char* reply) {
@@ -1270,9 +1355,14 @@ void RepeaterMesh::resetDutyCycleTimeoutRestarts() {
 
 void RepeaterMesh::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
     if (region_load_active) {
-        handleRegionLoadLine(command, reply);
+        handleRegionLoadLine(sender_timestamp, command, reply);
         return;
     }
+
+    /* Blank line: nothing to run.  The USB reader forwards these (see
+     * cli_rx_work_fn) because `region load` commits on one -- which is
+     * handled above, before this returns. */
+    if (StrHelper::isBlank(command)) { reply[0] = 0; return; }
 
     while (*command == ' ') command++;
 

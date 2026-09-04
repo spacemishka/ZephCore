@@ -318,6 +318,13 @@ void BaseChatMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender
 			} else {
 				sendAckTo(from, (uint8_t *)&ack_hash, 4);
 			}
+		} else {
+			/* Includes TXT_TYPE_CLI_COMMAND (v1.18+).  Upstream's companion
+			 * executes it when the contact carries flag 0x10; ZephCore
+			 * deliberately does not — see devdocs/UPSTREAM_TRACKER.md.  Logged
+			 * rather than dropped silently so the case is diagnosable. */
+			LOG_DBG("onPeerDataRecv: unhandled text type flags=%d from '%s'",
+				flags, from.name);
 		}
 	} else if (type == PAYLOAD_TYPE_REQ && len > 4) {
 		uint32_t sender_timestamp;
@@ -405,10 +412,37 @@ void BaseChatMesh::handleReturnPathRetry(const ContactInfo &contact, const uint8
 	if (rpath) sendDirect(rpath, contact.out_path, contact.out_path_len, 3000);
 }
 
+/* An unconfigured channel slot has an all-zero secret. */
+static bool isChannelSlotEmpty(const ChannelDetails &ch)
+{
+	static const uint8_t zeroes32[32] = { 0 };
+	return memcmp(ch.channel.secret, zeroes32, sizeof(ch.channel.secret)) == 0;
+}
+
 int BaseChatMesh::searchChannelsByHash(const uint8_t *hash, mesh::GroupChannel dest[], int max_matches)
 {
 	int n = 0;
 	for (int i = 0; i < MAX_GROUP_CHANNELS && n < max_matches; i++) {
+		/* Skip unconfigured slots.  The zero-key MAC validates against an
+		 * all-zero secret, so null-key group traffic (a sender with an unset
+		 * PSK) would be decrypted and delivered as if it belonged to that
+		 * slot — every node with a free slot is a null-key sink.
+		 *
+		 * The test is the secret, not name[0] as upstream uses: CMD_SET_CHANNEL
+		 * copies whatever 32-byte name the app supplies, so a configured
+		 * channel may carry an empty name and a cleared slot may keep a stale
+		 * one.  The zero secret is the exact condition that makes a slot
+		 * dangerous.
+		 *
+		 * A memset slot's hash is 0x00, which does not collide with the
+		 * null-key hash — but saveChannels() persists all MAX_GROUP_CHANNELS
+		 * slots and onChannelLoaded() runs setChannel() on each, recomputing
+		 * an empty slot's hash from its zero secret.  After the first save
+		 * plus reboot every free slot carries the live null-key hash.
+		 *
+		 * Skipping them also keeps empty slots from consuming dest[] entries
+		 * and crowding out a real channel whose hash byte happens to match. */
+		if (isChannelSlotEmpty(channels[i])) continue;
 		if (channels[i].channel.hash[0] == hash[0]) {
 			dest[n++] = channels[i].channel;
 		}
@@ -506,14 +540,14 @@ int BaseChatMesh::sendMessage(const ContactInfo &recipient, uint32_t timestamp, 
 }
 
 int BaseChatMesh::sendCommandData(const ContactInfo &recipient, uint32_t timestamp, uint8_t attempt,
-	const char *text, uint32_t &est_timeout)
+	uint8_t txt_type, const char *text, uint32_t &est_timeout)
 {
 	int text_len = strlen(text);
 	if (text_len > MAX_TEXT_LEN) return MSG_SEND_FAILED;
 
 	uint8_t temp[5 + MAX_TEXT_LEN + 1];
 	memcpy(temp, &timestamp, 4);
-	temp[4] = (attempt & 3) | (TXT_TYPE_CLI_DATA << 2);
+	temp[4] = (attempt & 3) | (txt_type << 2);
 	memcpy(&temp[5], text, text_len + 1);
 
 	mesh::Packet *pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, recipient.id,
