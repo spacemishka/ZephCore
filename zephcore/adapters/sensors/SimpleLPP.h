@@ -111,7 +111,7 @@ public:
      * @return Number of bytes written, or 0 on overflow
      */
     uint8_t addVoltage(uint8_t channel, float volts) {
-        uint16_t val = (uint16_t)(volts * LPP_VOLTAGE_MULT);
+        uint16_t val = clampRoundToUint16(volts * LPP_VOLTAGE_MULT);
         return addField2Unsigned(channel, LPP_VOLTAGE, val);
     }
 
@@ -122,7 +122,7 @@ public:
      * @return Number of bytes written, or 0 on overflow
      */
     uint8_t addCurrent(uint8_t channel, float amps) {
-        uint16_t val = (uint16_t)(amps * LPP_CURRENT_MULT);
+        uint16_t val = clampRoundToUint16(amps * LPP_CURRENT_MULT);
         return addField2Unsigned(channel, LPP_CURRENT, val);
     }
 
@@ -133,7 +133,7 @@ public:
      * @return Number of bytes written, or 0 on overflow
      */
     uint8_t addPower(uint8_t channel, float watts) {
-        uint16_t val = (uint16_t)watts;
+        uint16_t val = clampRoundToUint16(watts);
         return addField2Unsigned(channel, LPP_POWER, val);
     }
 
@@ -208,6 +208,12 @@ public:
     }
 
 private:
+    static uint16_t clampRoundToUint16(float value) {
+        if (!isfinite(value) || value <= 0.0f) return 0;
+        if (value >= (float)UINT16_MAX) return UINT16_MAX;
+        return (uint16_t)lroundf(value);
+    }
+
     uint8_t *_buffer;
     size_t _maxsize;
     size_t _cursor;

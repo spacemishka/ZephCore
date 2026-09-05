@@ -513,7 +513,7 @@ int BaseChatMesh::sendCommandData(const ContactInfo &recipient, uint32_t timesta
 
 	uint8_t temp[5 + MAX_TEXT_LEN + 1];
 	memcpy(temp, &timestamp, 4);
-	temp[4] = (attempt & 3) | (TXT_TYPE_CLI_DATA << 2);
+	temp[4] = (attempt & 3) | ((TXT_TYPE_CLI_DATA & 0x3F) << 2);
 	memcpy(&temp[5], text, text_len + 1);
 
 	mesh::Packet *pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, recipient.id,

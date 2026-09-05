@@ -413,7 +413,7 @@ static void on_dtr_change(bool dtr_active)
  * does (returns 0), so frames never tear and tx_has_space() stays truthful.
  * 0 means "ring full, retry when drained"; the caller (contact pump) backs off
  * and the TX-drain callback re-kicks it. */
-size_t zephcore_usb_companion_write_frame(const uint8_t *src, size_t len)
+extern "C" size_t zephcore_usb_companion_write_frame(const uint8_t *src, size_t len)
 {
 	if (!usb_dev || len == 0 || len > MAX_FRAME_SIZE) {
 		return 0;
@@ -444,7 +444,7 @@ size_t zephcore_usb_companion_write_frame(const uint8_t *src, size_t len)
 
 /* True if the TX ring can hold one more frame of `payload_len` (+3 framing).
  * The pump checks this before each contact so write_frame can't fail mid-dump. */
-bool zephcore_usb_companion_tx_has_space(size_t payload_len)
+extern "C" bool zephcore_usb_companion_tx_has_space(size_t payload_len)
 {
 	if (!usb_dev) {
 		return false;
@@ -455,7 +455,7 @@ bool zephcore_usb_companion_tx_has_space(size_t payload_len)
 	return ok;
 }
 
-void zephcore_usb_companion_reset_rx(void)
+extern "C" void zephcore_usb_companion_reset_rx(void)
 {
 	ring_buf_reset(&usb_ring_buf);
 	usb_rx_st = USB_RX_IDLE;
@@ -474,32 +474,32 @@ void zephcore_usb_companion_reset_rx(void)
 	k_spin_unlock(&usb_tx_lock, key);
 }
 
-bool zephcore_usb_companion_is_text_session(void)
+extern "C" bool zephcore_usb_companion_is_text_session(void)
 {
 	return usb_session_is_text;
 }
 
-void zephcore_usb_companion_set_session_start_cb(void (*cb)(void))
+extern "C" void zephcore_usb_companion_set_session_start_cb(void (*cb)(void))
 {
 	s_session_start_cb = cb;
 }
 
-void zephcore_usb_companion_set_session_end_cb(void (*cb)(void))
+extern "C" void zephcore_usb_companion_set_session_end_cb(void (*cb)(void))
 {
 	s_session_end_cb = cb;
 }
 
-void zephcore_usb_companion_set_tx_drain_cb(void (*cb)(void))
+extern "C" void zephcore_usb_companion_set_tx_drain_cb(void (*cb)(void))
 {
 	s_tx_drain_cb = cb;
 }
 
-void zephcore_usb_companion_set_cli_line_cb(void (*cb)(const char *line))
+extern "C" void zephcore_usb_companion_set_cli_line_cb(void (*cb)(const char *line))
 {
 	s_cli_line_cb = cb;
 }
 
-void zephcore_usb_companion_write_text(const char *text, size_t len)
+extern "C" void zephcore_usb_companion_write_text(const char *text, size_t len)
 {
 	if (!usb_dev || !text || len == 0) {
 		return;
@@ -510,7 +510,7 @@ void zephcore_usb_companion_write_text(const char *text, size_t len)
 	uart_irq_tx_enable(usb_dev);
 }
 
-void zephcore_usb_companion_init(struct k_event *mesh_events,
+extern "C" void zephcore_usb_companion_init(struct k_event *mesh_events,
 				 uint32_t mesh_event_ble_rx,
 				 void *board)
 {
