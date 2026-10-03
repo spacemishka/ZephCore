@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: MIT
  * Shared constants and utilities for all LoRa radio adapters.
  *
- * Anything duplicated between SX126xRadio and LR1110Radio belongs here.
+ * Radio-family-independent pieces used by LoRaRadio.
  * Radio-specific constants (e.g. SX126x duty cycle math) stay in
  * their respective headers.
  */
@@ -11,14 +11,7 @@
 
 #include <zephyr/drivers/lora.h>
 
-/* --- Noise floor calibration (EMA) ---
- * Median-of-N RSSI reads → EMA.  alpha = 1/8, converges in ~8 ticks.
- * Samples above floor + SAMPLING_THRESHOLD rejected as interference. */
-#define NOISE_FLOOR_EMA_SHIFT            3   /* alpha = 1/(1<<3) = 1/8 */
-#define NOISE_FLOOR_SAMPLES_PER_TICK     8   /* median of 8 reads per tick */
-#define NOISE_FLOOR_UNGUARDED_INTERVAL   16  /* ticks between unfiltered samples (power of 2) */
-#define NOISE_FLOOR_SAMPLING_THRESHOLD   14  /* dB above floor to reject as interference */
-#define DEFAULT_NOISE_FLOOR              0   /* sentinel: seed from first sample */
+#include "radio_tuning.h"
 
 /* --- RSSI read timing (SX1261/2 DS rev 2.2 Table 13-82) ---
  *
@@ -92,59 +85,6 @@ static inline uint32_t rssi_settle_delay_us(uint16_t bw_khz)
 /* Blocked attempts allowed before standing down to the next full interval. */
 #define NOISE_FLOOR_MAX_RETRIES          2
 
-/* --- Adaptive CAD (LBT detPeak calibration) ---
- * Housekeeping-tick CAD probes accumulate per-level busy/free statistics;
- * a one-sided staircase converges on the lowest detPeak offset whose
- * false-positive rate stays under target.  Levels are signed offsets from
- * the chip family's per-SF base detPeak (SX126x: SF+13; LR11xx/LR20xx:
- * 56-68 table) so the C++ layer stays scale-independent. */
-/* Operating-offset range (levels from the per-SF family base detPeak).  Wide
- * on purpose — a dense hilltop may need a much higher detPeak than a quiet
- * valley node; the per-family absolute clamp in the driver (SX126x 15-40,
- * LR 48-90) is a firmware guardrail against "CAD never/always fires", NOT a
- * chip limit (cadDetPeak is a full uint8_t).
- * MUST match CAD_OFFSET_MIN/MAX in helpers/NodePrefs.h. */
-#define CAD_LEVEL_MIN            (-8)  /* most sensitive probe level */
-#define CAD_LEVEL_MAX            12    /* least sensitive probe level */
-#define CAD_NUM_LEVELS           (CAD_LEVEL_MAX - CAD_LEVEL_MIN + 1)
-#define CAD_SWEEP_MIN            (-4)  /* dry-run sweep window (get cad with auto off) */
-#define CAD_SWEEP_MAX            4
-/* Knee-seeking staircase (replaces the earlier absolute-FP-target band).  The
- * FP-vs-detPeak curve falls as detPeak rises (less sensitive → fewer false
- * detects) and flattens past a knee; the sweet spot is the knee — the most
- * sensitive detPeak whose FP has already bottomed out.  The controller reads
- * the local curve SLOPE from three rungs (frontier op-1, operating op, op+1)
- * rather than an absolute FP level, so it converges the same way regardless of
- * a site's FP floor (which varies with traffic and classifier residual).
- *  - KNEE_SLOPE: the per-level FP change (permille) that counts as "steep".
- *    Below the knee the curve drops fast (step up toward the knee); at/above it
- *    the curve is flat (slope < KNEE_SLOPE).
- *  - PLATEAU_CLEAN: on a flat plateau, only reclaim sensitivity (step down) if
- *    FP is already this low — the guard that stops a flat-but-noisy curve from
- *    walking to the sensitive rail (there, holding is the least-bad move; a
- *    genuinely quiet flat-low site descends to the floor, which is correct). */
-#define CAD_KNEE_SLOPE_PERMILLE     50    /* >=5%/level FP change = steep */
-#define CAD_PLATEAU_CLEAN_PERMILLE  50    /* <=5% FP = clean enough to descend */
-#define CAD_STEP_MIN_PROBES         120   /* per-level samples before a step call */
-/* Airtime-protection cap on the TOTAL busy (defer) rate — false positives AND
- * real traffic.  The knee controller only minimises *false* busy, but on a
- * congested hilltop most busy verdicts are real distant traffic we'd never
- * actually collide with (capture effect), and deferring for all of it starves
- * the node's own airtime.  When the operating level's busy rate exceeds the
- * cap, step UP (less sensitive) regardless of FP — self-targeting, since a
- * quiet node's busy rate never reaches it.  HYST keeps a descend from bouncing
- * straight back into the cap.  The cap itself is a per-node pref
- * (`cad_busycap`, percent, `set cad.busycap`; default 25, 0 = off) since it is
- * a policy call (airtime vs. collision/capture), not a physical constant. */
-#define CAD_BUSY_DEFER_HYST_PERMILLE 100  /* descend only if frontier busy <= cap-10% */
-#define CAD_PROBE_RSSI_GUARD     7     /* dB above floor = channel visibly busy, skip probe */
-#define CAD_STATS_DECAY_MS       (6UL * 3600UL * 1000UL)  /* halve counters every 6 h */
-/* NOTE: the probe has no retry deadline and no wake of its own.  It runs off
- * the noise-floor sampler's measurement (LoRaRadioBase::cadMaintenance), which
- * already applies the idle-RX guards and yields a median-of-8.  Consequently
- * the effective probe rate is quantised to NOISE_FLOOR_INTERVAL_MS: setting
- * probe_interval below that just gets one probe per floor sample. */
-
 /* --- RX ring buffer --- */
 #define RX_RING_SIZE 8  /* ~2 KB; buffers burst arrivals at SF7/BW500 */
 
@@ -178,6 +118,14 @@ static inline uint32_t bandwidth_to_hz(enum lora_signal_bandwidth bw)
 	case BW_125_KHZ: return 125000;
 	case BW_250_KHZ: return 250000;
 	case BW_500_KHZ: return 500000;
+	/* The wide set — 2.4 GHz territory, LR2021 only today. These return the
+	 * chip's TRUE bandwidths, not the enum's round names: airtime and the
+	 * noise-floor clamp both hang off this number, so 203 must not be
+	 * reported as 200. */
+	case BW_200_KHZ:  return 203000;
+	case BW_400_KHZ:  return 406000;
+	case BW_800_KHZ:  return 812000;
+	case BW_1000_KHZ: return 1000000;
 	default:         return 125000;
 	}
 }
@@ -196,6 +144,18 @@ static inline enum lora_signal_bandwidth bw_khz_to_enum(uint16_t bw_khz)
 	case 125: return BW_125_KHZ;
 	case 250: return BW_250_KHZ;
 	case 500: return BW_500_KHZ;
+	/* Wide bandwidths, accepted under both spellings: the round name people
+	 * type and the chip's true value they may read off a datasheet. Both
+	 * select the same modem setting.
+	 *
+	 * Only the LR2021 implements these; every other driver here falls back
+	 * to 125 kHz for an unmapped enum, which would be a silent mismatch.
+	 * That is why the CLI only accepts a bandwidth above 500 on an LR2021
+	 * build — see the bw range check in CommonCLI.cpp. */
+	case 200: case 203:  return BW_200_KHZ;
+	case 400: case 406:  return BW_400_KHZ;
+	case 800: case 812:  return BW_800_KHZ;
+	case 1000:           return BW_1000_KHZ;
 	default:  return BW_125_KHZ;
 	}
 }
@@ -229,6 +189,10 @@ static inline int16_t noise_floor_min_dbm(uint16_t bw_khz)
 	case 125: return -123;   /* 10*log10(125000) = 51.0 */
 	case 250: return -120;   /* 10*log10(250000) = 54.0 */
 	case 500: return -117;   /* 10*log10(500000) = 57.0 */
+	case 200: case 203:  return -121;  /* 10*log10(203000)  = 53.1 */
+	case 400: case 406:  return -118;  /* 10*log10(406000)  = 56.1 */
+	case 800: case 812:  return -115;  /* 10*log10(812000)  = 59.1 */
+	case 1000:           return -114;  /* 10*log10(1000000) = 60.0 */
 	default:  return -123;   /* matches bw_khz_to_enum's 125 kHz fallback */
 	}
 }

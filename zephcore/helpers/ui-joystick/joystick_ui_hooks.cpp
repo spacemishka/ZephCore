@@ -197,15 +197,6 @@ extern "C" void ui_notify_packet_sent(void)
 	}
 }
 
-extern "C" void ui_set_ble_status(bool connected, const char *name)
-{
-	(void)name;
-	if (s_task) {
-		s_task->setBLEConnected(connected);
-		s_task->notify();
-	}
-}
-
 extern "C" void ui_set_radio_params(
 	uint32_t freq_hz,
 	uint8_t sf,
@@ -249,10 +240,10 @@ extern "C" bool ui_joystick_try_match_ack(uint32_t ack, uint8_t out_pubkey[6])
 	return true;
 }
 
-extern "C" void ui_set_battery(uint16_t mv, uint8_t /*pct*/)
+extern "C" void ui_set_battery(uint16_t mv, uint8_t pct)
 {
 	if (s_task) {
-		s_task->setCachedBattMilliVolts(mv);
+		s_task->setCachedBattery(mv, pct);
 	}
 }
 
@@ -268,13 +259,14 @@ extern "C" void ui_set_ble_enabled(bool enabled)
  * push-model hooks from the old button UI have no work to do. */
 extern "C" void ui_set_gps_data(bool, uint8_t, int32_t, int32_t, int32_t) {}
 extern "C" void ui_set_clock(uint32_t) {}
+/* The joystick UI reads tz_offset straight off NodePrefs at render time. */
+extern "C" void ui_set_tz(int8_t) {}
 extern "C" void ui_add_recent(const char *, int16_t, uint32_t) {}
 extern "C" void ui_set_node_name(const char *) {}
 extern "C" void ui_clear_recent(void) {}
-extern "C" void ui_set_sensor_data(int16_t, uint32_t, uint16_t, uint16_t) {}
 extern "C" void ui_set_gps_available(bool) {}
 extern "C" void ui_set_gps_enabled(bool) {}
 extern "C" void ui_set_gps_state(uint8_t, uint32_t, uint32_t) {}
-extern "C" void ui_set_buzzer_quiet(bool) {}
+extern "C" void ui_set_buzzer_mode(uint8_t) {}
 extern "C" void ui_set_offgrid_mode(bool) {}
 extern "C" void ui_set_msg_count(uint16_t count) {}
