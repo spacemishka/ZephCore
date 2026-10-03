@@ -32,13 +32,15 @@
 LOG_MODULE_REGISTER(zephcore_observer_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #include <app/RepeaterDataStore.h>
+#include "../adapters/datastore/ZephyrFsFormat.h"
 #include <app/ObserverMesh.h>
 #include <adapters/clock/ZephyrRTCClock.h>
-#include <mesh/RadioIncludes.h>
+#include <src/RadioIncludes.h>
 #include <ZephyrWiFiStation.h>
 #include <ZephyrMQTTPublisher.h>
 #include "observer_creds.h"
-#include <helpers/led_gate.h>
+#include <helpers/boot_prefs.h>
+#include <src/mesh_events.h>
 
 /* ========== LED (optional) ========== */
 
@@ -50,10 +52,9 @@ static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
 /* ========== Event loop bits ========== */
 
-#define MESH_EVENT_LORA_RX     BIT(0)
-#define MESH_EVENT_CLI_RX      BIT(1)
-#define MESH_EVENT_STATUS      BIT(2)
-#define MESH_EVENT_MQTT_CONNECT BIT(3)  /* MQTT (re)connected — publish status+self-advert on main */
+/* The shared bits are in mesh_events.h; these are the observer's own. */
+#define MESH_EVENT_STATUS       BIT(MESH_EVENT_ROLE_BASE)      /* 300 s status publish */
+#define MESH_EVENT_MQTT_CONNECT BIT(MESH_EVENT_ROLE_BASE + 1)  /* MQTT (re)connected — publish status+self-advert on main */
 #define MESH_EVENT_ALL       (MESH_EVENT_LORA_RX | MESH_EVENT_CLI_RX | MESH_EVENT_STATUS | MESH_EVENT_MQTT_CONNECT)
 
 static struct k_event mesh_events;
@@ -85,7 +86,12 @@ static void cli_println(const char *s)
 static void cli_uart_isr(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
-	while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+	for (;;) {
+		uart_irq_update(dev);
+		if (uart_irq_is_pending(dev) <= 0) {
+			break;
+		}
+
 		if (uart_irq_rx_ready(dev)) {
 			uint8_t buf[64];
 			int n = uart_fifo_read(dev, buf, sizeof(buf));
@@ -206,6 +212,32 @@ static void print_banner(void)
 
 /* ========== CLI RX processing ========== */
 
+#if IS_ENABLED(CONFIG_ZEPHCORE_PACKET_LOGGING)
+/* A packet line ended the echo of a half-typed command (helpers/PacketLog.h). */
+static bool cli_echo_cut;
+
+extern "C" void zc_console_line_start(void)
+{
+	if (cli_line_idx > 0 && !cli_echo_cut) {
+		cli_print("\r\n");
+		cli_echo_cut = true;
+	}
+}
+
+/* Before echoing more of a cut command, reprint what was typed so far. */
+static void cli_echo_resume(void)
+{
+	if (cli_echo_cut && usb_dev) {
+		for (uint16_t i = 0; i < cli_line_idx; i++) {
+			uart_poll_out(usb_dev, cli_line[i]);
+		}
+	}
+	cli_echo_cut = false;
+}
+#else
+static inline void cli_echo_resume(void) {}
+#endif
+
 static void process_cli_rx(void)
 {
 	uint8_t byte;
@@ -231,15 +263,18 @@ static void process_cli_rx(void)
 				}
 				cli_line_idx = 0;
 			}
+			cli_echo_resume();   /* nothing left to reprint: just clears */
 			cli_print("\r\n");
 		} else if (byte == 0x7F || byte == 0x08) {
 			if (cli_line_idx > 0) {
+				cli_echo_resume();
 				cli_line_idx--;
 				uart_poll_out(usb_dev, '\b');
 				uart_poll_out(usb_dev, ' ');
 				uart_poll_out(usb_dev, '\b');
 			}
 		} else if (cli_line_idx < sizeof(cli_line) - 1) {
+			cli_echo_resume();
 			uart_poll_out(usb_dev, byte);
 			cli_line[cli_line_idx++] = (char)byte;
 		}
@@ -268,18 +303,10 @@ static mesh::ZephyrMillisecondClock s_ms_clock;
 
 static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
 
-/* Static-init placeholder only.  The radio is rebound to the mesh's own
- * NodePrefs via setPrefs() in main() before observer_mesh.begin() — this object
- * is not the live radio configuration and is never loaded from flash. */
-static NodePrefs s_radio_prefs;
+/* Radio is constructed with no prefs pointer; main() binds it to the mesh's
+ * NodePrefs via setPrefs() before observer_mesh.begin(). */
 
-#if IS_ENABLED(CONFIG_ZEPHCORE_RADIO_LR1110)
-static mesh::LR1110Radio lora_radio(lora_dev, s_board, &s_radio_prefs);
-#elif IS_ENABLED(CONFIG_ZEPHCORE_RADIO_SX127X)
-static mesh::SX127xRadio lora_radio(lora_dev, s_board, &s_radio_prefs);
-#else
-static mesh::SX126xRadio lora_radio(lora_dev, s_board, &s_radio_prefs);
-#endif
+static mesh::LoRaRadio lora_radio(lora_dev, s_board);
 
 static mesh::ObserverMesh observer_mesh(lora_radio, s_ms_clock, s_rtc_clock);
 static RepeaterDataStore  data_store;
@@ -288,13 +315,6 @@ static RepeaterDataStore  data_store;
 
 int main(void)
 {
-	/* Initialize radio prefs with observer-specific defaults */
-	initNodePrefs(&s_radio_prefs);
-	s_radio_prefs.cr           = 5;   /* CR 4/5 (initNodePrefs sets 8) */
-	s_radio_prefs.tx_power_dbm = 0;   /* observer never TXes */
-	strncpy(s_radio_prefs.node_name, "Observer",
-		sizeof(s_radio_prefs.node_name) - 1);
-
 	/* Brief boot delay — lets USB enumerate before first log */
 	k_sleep(K_MSEC(1500));
 	LOG_INF("=== ZephCore Observer starting ===");
@@ -305,6 +325,24 @@ int main(void)
 		gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
 	}
 #endif
+
+	/* First boot on a volume that is not this role's - a fresh chip, a
+	 * companion, or a node that was running Arduino MeshCore, whose nRF52
+	 * filesystems overlap our lfs_partition
+	 * (devdocs/HANDOVER_lfs_arduino_overlap.md).  Erase everything so we
+	 * start from a known state: Zephyr's automount only
+	 * auto-formats the LittleFS volume when it fails to mount, and never
+	 * touches storage_partition (BLE bonds NVS) or QSPI.
+	 *
+	 * Self-limiting, so it needs no "done" marker: the identity is generated
+	 * and saved a few lines below, and loadPrefs() persists defaults on the
+	 * same boot, so the next boot sees this role's data and skips this. */
+	if (!data_store.hasRoleData()) {
+		LOG_WRN("Volume holds no data for this role - formatting before first boot");
+		if (!zephcore_fs_format_all(nullptr)) {
+			LOG_ERR("First-boot format failed - /lfs is not mounted");
+		}
+	}
 
 	/* Initialize LittleFS data store */
 	if (!data_store.begin()) {
@@ -326,10 +364,8 @@ int main(void)
 	 *
 	 * The radio reads freq/bw/sf/cr through this pointer, both during
 	 * begin() → Dispatcher::begin() → Radio::begin() and on every later
-	 * reconfigure() (LoRaRadioBase::reconfigureWithParams() ignores its
-	 * arguments and re-reads the pointer).  Constructed against
-	 * s_radio_prefs, which is never loaded from flash, the radio stayed on
-	 * the compiled-in defaults forever: `set freq/sf/bw/cr` wrote flash and
+	 * reconfigure().  Bound to a placeholder that was never loaded from
+	 * flash, the radio stayed on the compiled-in defaults forever: `set freq/sf/bw/cr` wrote flash and
 	 * updated the CLI/MQTT readback but never reached the hardware, so the
 	 * setting looked accepted and then "reverted" on reboot.
 	 *
@@ -347,8 +383,8 @@ int main(void)
 	NodePrefs *prefs = observer_mesh.getNodePrefs();
 	/* "Observer" is deliberately NOT in this list: it is a name a user can set,
 	 * and regenerating it here made `set name Observer` silently revert on every
-	 * reboot.  "Repeater" is the name the shared store writes on first boot, so
-	 * it still counts as unset. */
+	 * reboot.  "Repeater" is the name the shared store wrote on first boot
+	 * until 2026-09, so it still counts as unset. */
 	if (strlen(prefs->node_name) == 0 ||
 	    strcmp(prefs->node_name, "Repeater") == 0) {
 		/* Use first 4 bytes of pubkey for uniqueness */
@@ -361,11 +397,8 @@ int main(void)
 	/* Apply the persisted LED master switch. The observer has no CLI of its own
 	 * to change it, but a unit reflashed from a repeater build keeps the setting
 	 * — and it still drives lora-tx-led on TX-capable boards. */
-	{
-		bool leds_off = prefs->leds_disabled != 0;
-		zephcore_leds_set_disabled(leds_off);
-		LOG_INF("LEDs: %s (from prefs)", leds_off ? "disabled" : "enabled");
-	}
+	apply_boot_prefs(prefs, false);
+	gps_park();  /* unused here; see ZephyrGPSManager.h */
 
 	/* Initialize USB serial for CLI */
 #if ZEPHCORE_USB_STACK && DT_HAS_COMPAT_STATUS_OKAY(zephyr_cdc_acm_uart)
@@ -389,7 +422,7 @@ int main(void)
 	print_banner();
 
 	/* Start WiFi (non-blocking — MQTT thread waits for WIFI_READY_BIT) */
-	zc_wifi_station_start(&s_creds, time_sync_cb);
+	zc_wifi_station_start(s_creds.wifi_ssid, s_creds.wifi_psk, time_sync_cb);
 
 	/* Start MQTT publisher thread */
 	char client_id[64];
